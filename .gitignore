@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local Claude Code project state (per-project permissions, memory, etc.)
+.claude/
+
+# Firecrawl cache (local dev artifact)
+.firecrawl/
+
+# Runtime sessions (if ever written into the repo directory)
+/tmp/auditit/
