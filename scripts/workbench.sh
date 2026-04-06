@@ -93,21 +93,60 @@ _read_state() {
     fi
 }
 
+_setup_config_dir() {
+    # Create a temporary config directory that mirrors ~/.claude via symlinks,
+    # but with our own settings.json containing audit hooks.
+    # Usage: _setup_config_dir <session_settings_path>
+    # Sets: CONFIG_DIR (caller reads this variable)
+    local session_settings="$1"
+    local real_claude_dir="${HOME}/.claude"
+    CONFIG_DIR="$(dirname "$session_settings")/config"
+    mkdir -p "$CONFIG_DIR"
+
+    # Symlink everything from ~/.claude except settings.json
+    for item in "$real_claude_dir"/*; do
+        local name
+        name="$(basename "$item")"
+        [ "$name" = "settings.json" ] && continue
+        [ -e "$CONFIG_DIR/$name" ] || ln -s "$item" "$CONFIG_DIR/$name"
+    done
+
+    # Also link hidden files (credentials etc.) — glob * doesn't match dotfiles
+    # Use find to avoid zsh "no matches found" error when no dotfiles exist.
+    find "$real_claude_dir" -maxdepth 1 -name '.*' -not -name '.' -not -name '..' | while read -r item; do
+        local name
+        name="$(basename "$item")"
+        [ -e "$CONFIG_DIR/$name" ] || ln -s "$item" "$CONFIG_DIR/$name"
+    done
+
+    # Copy our audit-hooked settings.json into the config dir
+    cp "$session_settings" "$CONFIG_DIR/settings.json"
+    _log "Config dir: $CONFIG_DIR"
+}
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 cmd_start() {
     _ensure_python
     _ensure_tmux_installed
 
-    local session_dir="" model="" repo_root=""
+    local session_dir="" model="" repo_root="" base_url="" command=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --session-dir) session_dir="$2"; shift 2 ;;
             --model)       model="$2";       shift 2 ;;
             --repo-root)   repo_root="$2";   shift 2 ;;
+            --base-url)    base_url="$2";    shift 2 ;;
+            --command)     command="$2";      shift 2 ;;
             *) _err "未知参数: $1"; exit 1 ;;
         esac
     done
+
+    # --model and --command are mutually exclusive
+    if [ -n "$model" ] && [ -n "$command" ]; then
+        _err "--model 和 --command 互斥，只能选一个"
+        exit 1
+    fi
 
     # Resolve repo_root (default = current pwd)
     if [ -z "$repo_root" ]; then
@@ -166,24 +205,47 @@ cmd_start() {
     tmux select-pane -t "$audit_pane" -T "AUDIT"
 
     local worker_pane=""
-    if [ -n "$model" ]; then
-        # Create worker pane first (empty shell) — we'll send the claude command
+    if [ -n "$model" ] || [ -n "$command" ]; then
+        # Create worker pane first (empty shell) — we'll send the command
         # after state is written, so hooks can resolve SESSION_DIR immediately.
+        local worker_title="WORKER"
+        [ -n "$model" ] && worker_title="WORKER (${model})"
+        [ -n "$command" ] && worker_title="WORKER (command)"
         worker_pane=$(tmux split-window -v -t "$audit_pane" -l 50% -P -F '#{pane_id}' -c "$repo_root")
-        tmux select-pane -t "$worker_pane" -T "WORKER (${model})"
+        tmux select-pane -t "$worker_pane" -T "$worker_title"
     fi
 
     # Write full state with all pane IDs BEFORE worker fires any hook.
     _write_state "$session_dir" "$audit_pane" "$auditor_pane" "$worker_pane"
 
-    if [ -n "$worker_pane" ]; then
-        local claude_cmd="AUDITIT_TARGET=1 claude --model ${model} --permission-mode bypassPermissions --settings ${session_settings}"
+    if [ -n "$model" ] && [ -n "$worker_pane" ]; then
+        # --model mode: launch a single claude instance with --settings
+        local claude_cmd="AUDITIT_TARGET=1"
+        if [ -n "$base_url" ]; then
+            claude_cmd+=" ANTHROPIC_BASE_URL=${base_url}"
+        fi
+        claude_cmd+=" claude --model ${model} --permission-mode bypassPermissions --settings ${session_settings}"
         tmux send-keys -t "$worker_pane" "$claude_cmd" Enter
         _log "布局: 左=AUDITOR | 右上=AUDIT | 右下=WORKER(${model})"
+        [ -n "$base_url" ] && _log "API: ${base_url}"
+    elif [ -n "$command" ] && [ -n "$worker_pane" ]; then
+        # --command mode: set up CLAUDE_CONFIG_DIR so all child claude processes
+        # inherit audit hooks via env var (no --settings needed per process).
+        _setup_config_dir "$session_settings"
+        local env_prefix="AUDITIT_TARGET=1 CLAUDE_CONFIG_DIR='${CONFIG_DIR}'"
+        [ -n "$base_url" ] && env_prefix+=" ANTHROPIC_BASE_URL='${base_url}'"
+        tmux send-keys -t "$worker_pane" "${env_prefix} ${command}" Enter
+        _log "布局: 左=AUDITOR | 右上=AUDIT | 右下=WORKER(command)"
+        _log "命令: ${command}"
+        _log "CLAUDE_CONFIG_DIR=${CONFIG_DIR}"
+        [ -n "$base_url" ] && _log "API: ${base_url}"
     else
         _log "布局: 左=AUDITOR | 右=AUDIT"
         _log "运行被审计的 claude 时加上环境变量和 --settings："
-        _log "  AUDITIT_TARGET=1 claude --settings $session_settings"
+        local hint="AUDITIT_TARGET=1"
+        [ -n "$base_url" ] && hint+=" ANTHROPIC_BASE_URL=${base_url}"
+        hint+=" claude --settings $session_settings"
+        _log "  $hint"
     fi
 
     tmux select-pane -t "$auditor_pane"
@@ -271,7 +333,7 @@ cmd_launch() {
     _ensure_python
     _kill_other_panes
 
-    local prompt="" repo_root="." model="sonnet" max_turns="100" session_dir=""
+    local prompt="" repo_root="." model="sonnet" max_turns="100" session_dir="" base_url=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -280,6 +342,7 @@ cmd_launch() {
             --model)       model="$2";       shift 2 ;;
             --max-turns)   max_turns="$2";   shift 2 ;;
             --session-dir) session_dir="$2"; shift 2 ;;
+            --base-url)    base_url="$2";    shift 2 ;;
             *) _err "未知参数: $1"; exit 1 ;;
         esac
     done
@@ -331,8 +394,10 @@ cmd_launch() {
     local real_repo_root
     real_repo_root="$(realpath "$repo_root")"
     (
-        cd "$real_repo_root" && \
-        AUDITIT_TARGET=1 claude -p \
+        cd "$real_repo_root"
+        export AUDITIT_TARGET=1
+        [ -n "$base_url" ] && export ANTHROPIC_BASE_URL="$base_url"
+        claude -p \
             --model "$model" \
             --max-turns "$max_turns" \
             --permission-mode bypassPermissions \
@@ -348,6 +413,7 @@ cmd_launch() {
     tmux select-pane -t "$origin_pane"
 
     _log "已启动 claude -p (model=${model}, max-turns=${max_turns}, pid=${agent_pid})"
+    [ -n "$base_url" ] && _log "API: ${base_url}"
     _log "Agent 输出将保存至: $session_dir/output.txt"
     _log "完成后运行: bash $0 stop"
 }
@@ -412,12 +478,18 @@ case "${1:-help}" in
 auditit — Claude Code Session Audit Monitor
 
 Commands:
-  start   [--model MODEL] [--repo-root DIR] [--session-dir DIR]
-      Open audit pane. With --model: also opens interactive claude worker pane.
+  start   [--model MODEL | --command CMD] [--base-url URL] [--repo-root DIR] [--session-dir DIR]
+      Open audit pane. --model and --command are mutually exclusive.
+      --model:    opens interactive claude worker pane with that model.
+      --command:  runs an arbitrary command in the worker pane; all claude
+                  processes spawned by the command are audited automatically
+                  via CLAUDE_CONFIG_DIR (no --settings needed per process).
+      --base-url: sets ANTHROPIC_BASE_URL for the worker process.
       Layout: left=auditor(you) | right-top=AUDIT | right-bottom=WORKER
 
-  launch  --prompt STR [--repo-root DIR] [--model MODEL] [--max-turns N]
+  launch  --prompt STR [--repo-root DIR] [--model MODEL] [--base-url URL] [--max-turns N]
       Run claude -p in background, single AUDIT pane shows progress.
+      --base-url sets ANTHROPIC_BASE_URL for the claude -p process.
       Agent output saved to session-dir/output.txt.
 
   stop

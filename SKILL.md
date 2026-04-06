@@ -76,8 +76,8 @@ bash "$SKILL_DIR/workbench.sh" start
 
 | Command | Description |
 |---------|-------------|
-| `start [--model MODEL] [--repo-root DIR]` | Generate session settings + open audit pane (with --model: also opens worker pane) |
-| `launch --prompt STR [--model MODEL]` | Run claude -p in background with audit pane |
+| `start [--model MODEL ❘ --command CMD] [--base-url URL] [--repo-root DIR]` | Generate session settings + open audit pane (with --model: single claude worker; with --command: arbitrary command, all child claude processes audited via CLAUDE_CONFIG_DIR) |
+| `launch --prompt STR [--model MODEL] [--base-url URL]` | Run claude -p in background with audit pane |
 | `stop` | Close audit/worker panes |
 | `replay [audit.jsonl]` | Replay an existing audit log |
 | `status` | Show current session status |
@@ -93,7 +93,7 @@ Use `launch` — it runs the task headlessly and shows the audit pane:
 bash "$SKILL_DIR/workbench.sh" launch --prompt '用户给出的 prompt'
 ```
 
-Optional flags: `--model sonnet|opus`, `--max-turns N`, `--repo-root DIR`
+Optional flags: `--model sonnet|opus`, `--base-url URL`, `--max-turns N`, `--repo-root DIR`
 
 ### When the user wants to monitor their own interactive `claude` session
 

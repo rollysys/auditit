@@ -38,8 +38,12 @@ case "$INPUT" in
     *) exit 0 ;;
 esac
 
+# Capture API base URL from the environment (inherited from the claude process).
+# Empty string means default Anthropic API.
+BASE_URL="${ANTHROPIC_BASE_URL:-}"
+
 # Build the full line in a variable, then write in one shot to minimize
 # interleaving when multiple hooks fire concurrently.
-LINE=$(printf '{"ts":"%s","event":"%s","data":%s}' "$TS" "$EVENT" "$INPUT")
+LINE=$(printf '{"ts":"%s","event":"%s","base_url":"%s","data":%s}' "$TS" "$EVENT" "$BASE_URL" "$INPUT")
 printf '%s\n' "$LINE" >> "$LOG"
 exit 0

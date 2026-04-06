@@ -93,6 +93,7 @@ class AuditDisplay:
         self.agents: dict[str, AgentState] = {}
         self.root_agent_id: Optional[str] = None
         self.session_model: str = "unknown"
+        self.session_base_url: str = ""
         self.session_started: bool = False
         self.total_cost: float = 0.0
         self.session_ended: bool = False
@@ -190,9 +191,14 @@ class AuditDisplay:
         return any(sid.startswith(a) or a.startswith(sid) for a in self._allowed_sids)
 
     def _dispatch(self, obj: dict) -> None:
-        event = obj.get("event", "")
-        data  = obj.get("data", {})
-        ts    = ts_to_local(obj.get("ts", ""))
+        event    = obj.get("event", "")
+        data     = obj.get("data", {})
+        ts       = ts_to_local(obj.get("ts", ""))
+        base_url = obj.get("base_url", "")
+
+        # Attach base_url from envelope so handlers can access it
+        if base_url:
+            data["_base_url"] = base_url
 
         if self._filter_sid:
             sid = data.get("session_id", "")
@@ -216,6 +222,7 @@ class AuditDisplay:
     def _on_sessionstart(self, ts: str, data: dict) -> None:
         sid = data.get("session_id", "root")
         transcript = data.get("transcript_path", "")
+        base_url = data.get("_base_url", "")
 
         ag = self._agent(sid, depth=0)
         if transcript:
@@ -225,11 +232,16 @@ class AuditDisplay:
         if not self.root_agent_id:
             self.root_agent_id = sid
             ag.started_at = ts
+            if base_url:
+                self.session_base_url = base_url
 
         if not self.session_started:
             self.session_started = True
 
-        self._print(f"[dim]{ts}[/dim]  ⚙  [bold]SESSION START[/bold]  [dim]{sid[:12]}[/dim]")
+        line = f"[dim]{ts}[/dim]  ⚙  [bold]SESSION START[/bold]  [dim]{sid[:12]}[/dim]"
+        if base_url:
+            line += f"  [dim]api={base_url}[/dim]"
+        self._print(line)
 
     def _on_userpromptsubmit(self, ts: str, data: dict) -> None:
         prompt = data.get("prompt", data.get("message", ""))
@@ -430,6 +442,8 @@ class AuditDisplay:
         parts.append(f"out={out:,}")
         if sub_agents:
             parts.append(f"sub-agents={len(sub_agents)}")
+        if self.session_base_url:
+            parts.append(f"[dim]api={self.session_base_url}[/dim]")
 
         self._print(f"📊 " + "  │  ".join(parts))
 
