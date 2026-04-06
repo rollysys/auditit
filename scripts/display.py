@@ -471,7 +471,7 @@ def follow(path: Path, display: AuditDisplay) -> None:
         print("auditit: 超时，未检测到会话启动", file=sys.stderr)
         return
 
-    with open(path) as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         idle_after_end = 0.0
         while True:
             line = fh.readline()
@@ -488,7 +488,7 @@ def follow(path: Path, display: AuditDisplay) -> None:
 
 def replay(path: Path, display: AuditDisplay, delay: float = 0.0) -> None:
     """Replay an existing audit log from beginning."""
-    with open(path) as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             display.process_line(line)
             if delay:
