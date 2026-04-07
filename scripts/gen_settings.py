@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-gen_settings.py — Generate a session-specific settings.json with audit hooks.
+gen_settings.py — Generate a session-specific settings.json with audit hooks only.
 
-Reads the user's global ~/.claude/settings.json, merges audit hooks into it,
-and writes the result to a session-local file. The global file is NEVER modified.
+Produces a minimal settings.json containing only audit hooks. Does NOT inherit
+the user's global ~/.claude/settings.json — Claude Code merges all setting
+sources (flag, user, project, local) at runtime, so duplicating global settings
+into flagSettings would cause hooks to execute twice and permissions to conflict.
 
 Usage:
     python gen_settings.py generate --output /tmp/auditit/session-xxx/settings.json
@@ -20,35 +22,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util import HOOK_EVENTS
 
-GLOBAL_SETTINGS = Path.home() / ".claude" / "settings.json"
 HOOK_SCRIPT = Path(__file__).resolve().parent.parent / "hooks" / "audit_hook.sh"
 
 
-def _load_global() -> dict:
-    if GLOBAL_SETTINGS.exists():
-        try:
-            return json.loads(GLOBAL_SETTINGS.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
-
-
 def generate(output: Path) -> None:
-    """Create a session-specific settings.json = global settings + audit hooks."""
-    settings = _load_global()
-    hooks = settings.setdefault("hooks", {})
-
+    """Create a minimal settings.json containing only audit hooks."""
+    hooks: dict[str, list] = {}
     for event in HOOK_EVENTS:
         cmd = f"bash {HOOK_SCRIPT} {event}"
-        group = {"hooks": [{"type": "command", "command": cmd}]}
+        hooks[event] = [{"hooks": [{"type": "command", "command": cmd}]}]
 
-        event_hooks = hooks.setdefault(event, [])
-        # Remove any stale auditit hooks (by command path pattern)
-        hooks[event] = [
-            h for h in event_hooks
-            if not any("audit_hook.sh" in hk.get("command", "") for hk in h.get("hooks", []))
-        ]
-        hooks[event].append(group)
+    settings = {"hooks": hooks}
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(settings, indent=2) + "\n")

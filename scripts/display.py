@@ -219,6 +219,36 @@ class AuditDisplay:
 
     # ── Individual event handlers ─────────────────────────────────────
 
+    def _on_auditmeta(self, ts: str, data: dict) -> None:
+        """Display audit launch parameters as a header block."""
+        mode = data.get("mode", "?")
+        model = data.get("model", "")
+        base_url = data.get("base_url", "")
+        repo = data.get("repo_root", "")
+        command = data.get("command", "")
+        prompt = data.get("prompt_preview", "")
+        max_turns = data.get("max_turns", "")
+        bare = data.get("bare", False)
+
+        self._print("[bold cyan]═══ AUDITIT ═══[/bold cyan]")
+        parts = [f"[bold]mode[/bold]={mode}"]
+        if model:
+            parts.append(f"[bold]model[/bold]={model}")
+        if max_turns:
+            parts.append(f"[bold]max_turns[/bold]={max_turns}")
+        if bare:
+            parts.append("[yellow]bare[/yellow]")
+        if base_url:
+            parts.append(f"[bold]api[/bold]={base_url}")
+        if repo:
+            parts.append(f"[bold]cwd[/bold]={repo}")
+        self._print("  " + "  │  ".join(parts))
+        if command:
+            self._print(f"  [bold]command[/bold]={command}")
+        if prompt:
+            self._print(f"  [bold]prompt[/bold]=[dim]{prompt}[/dim]")
+        self._print("[dim]───────────────[/dim]")
+
     def _on_sessionstart(self, ts: str, data: dict) -> None:
         sid = data.get("session_id", "root")
         transcript = data.get("transcript_path", "")

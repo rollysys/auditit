@@ -142,11 +142,9 @@ cmd_start() {
         esac
     done
 
-    # --model and --command are mutually exclusive
-    if [ -n "$model" ] && [ -n "$command" ]; then
-        _err "--model 和 --command 互斥，只能选一个"
-        exit 1
-    fi
+    # --model without --command: launch single claude worker
+    # --model with --command: inject ANTHROPIC_DEFAULT_SONNET_MODEL for sub-agents
+    # --command without --model: user script decides model
 
     # Resolve repo_root (default = current pwd)
     if [ -z "$repo_root" ]; then
@@ -174,8 +172,20 @@ cmd_start() {
     _log "审计会话目录: $session_dir"
     _log "工作目录: $repo_root"
 
-    # Generate per-session settings (global settings + audit hooks)
+    # Generate per-session settings (audit hooks only)
     python3 "$SCRIPT_DIR/gen_settings.py" generate --output "$session_settings"
+
+    # Write audit metadata as the first event so display.py can show launch params
+    local start_mode="manual"
+    [ -n "$model" ] && start_mode="model"
+    [ -n "$command" ] && start_mode="command"
+    local meta_ts
+    meta_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf '{"ts":"%s","event":"AuditMeta","base_url":"%s","data":{"mode":"%s","model":"%s","base_url":"%s","repo_root":"%s","command":"%s"}}\n' \
+        "$meta_ts" "${base_url}" "$start_mode" "$model" "${base_url}" \
+        "$repo_root" \
+        "$(printf '%s' "$command" | head -c 100 | tr '"\\' '..')" \
+        >> "$audit_log"
 
     # Target: new tmux session (outside tmux) or new window (inside tmux)
     local sess_name="" win_target
@@ -209,8 +219,11 @@ cmd_start() {
         # Create worker pane first (empty shell) — we'll send the command
         # after state is written, so hooks can resolve SESSION_DIR immediately.
         local worker_title="WORKER"
-        [ -n "$model" ] && worker_title="WORKER (${model})"
-        [ -n "$command" ] && worker_title="WORKER (command)"
+        if [ -n "$command" ]; then
+            worker_title="WORKER (command${model:+ / $model})"
+        elif [ -n "$model" ]; then
+            worker_title="WORKER (${model})"
+        fi
         worker_pane=$(tmux split-window -v -t "$audit_pane" -l 50% -P -F '#{pane_id}' -c "$repo_root")
         tmux select-pane -t "$worker_pane" -T "$worker_title"
     fi
@@ -218,26 +231,28 @@ cmd_start() {
     # Write full state with all pane IDs BEFORE worker fires any hook.
     _write_state "$session_dir" "$audit_pane" "$auditor_pane" "$worker_pane"
 
-    if [ -n "$model" ] && [ -n "$worker_pane" ]; then
-        # --model mode: launch a single claude instance with --settings
-        local claude_cmd="AUDITIT_TARGET=1"
+    if [ -n "$command" ] && [ -n "$worker_pane" ]; then
+        # --command mode: set up CLAUDE_CONFIG_DIR so all child claude processes
+        # inherit audit hooks via env var (no --settings needed per process).
+        _setup_config_dir "$session_settings"
+        local env_prefix="AUDITIT_TARGET=1 CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=50000 CLAUDE_CONFIG_DIR='${CONFIG_DIR}'"
+        [ -n "$model" ] && env_prefix+=" ANTHROPIC_DEFAULT_SONNET_MODEL='${model}'"
+        [ -n "$base_url" ] && env_prefix+=" ANTHROPIC_BASE_URL='${base_url}'"
+        tmux send-keys -t "$worker_pane" "${env_prefix} ${command}" Enter
+        _log "布局: 左=AUDITOR | 右上=AUDIT | 右下=WORKER(command)"
+        _log "命令: ${command}"
+        [ -n "$model" ] && _log "Model: ${model}"
+        _log "CLAUDE_CONFIG_DIR=${CONFIG_DIR}"
+        [ -n "$base_url" ] && _log "API: ${base_url}"
+    elif [ -n "$model" ] && [ -n "$worker_pane" ]; then
+        # --model mode (no --command): launch a single claude instance with --settings
+        local claude_cmd="AUDITIT_TARGET=1 ANTHROPIC_DEFAULT_SONNET_MODEL=${model} CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=50000"
         if [ -n "$base_url" ]; then
             claude_cmd+=" ANTHROPIC_BASE_URL=${base_url}"
         fi
         claude_cmd+=" claude --model ${model} --permission-mode bypassPermissions --settings ${session_settings}"
         tmux send-keys -t "$worker_pane" "$claude_cmd" Enter
         _log "布局: 左=AUDITOR | 右上=AUDIT | 右下=WORKER(${model})"
-        [ -n "$base_url" ] && _log "API: ${base_url}"
-    elif [ -n "$command" ] && [ -n "$worker_pane" ]; then
-        # --command mode: set up CLAUDE_CONFIG_DIR so all child claude processes
-        # inherit audit hooks via env var (no --settings needed per process).
-        _setup_config_dir "$session_settings"
-        local env_prefix="AUDITIT_TARGET=1 CLAUDE_CONFIG_DIR='${CONFIG_DIR}'"
-        [ -n "$base_url" ] && env_prefix+=" ANTHROPIC_BASE_URL='${base_url}'"
-        tmux send-keys -t "$worker_pane" "${env_prefix} ${command}" Enter
-        _log "布局: 左=AUDITOR | 右上=AUDIT | 右下=WORKER(command)"
-        _log "命令: ${command}"
-        _log "CLAUDE_CONFIG_DIR=${CONFIG_DIR}"
         [ -n "$base_url" ] && _log "API: ${base_url}"
     else
         _log "布局: 左=AUDITOR | 右=AUDIT"
@@ -333,7 +348,7 @@ cmd_launch() {
     _ensure_python
     _kill_other_panes
 
-    local prompt="" repo_root="." model="sonnet" max_turns="100" session_dir="" base_url=""
+    local prompt="" repo_root="." model="sonnet" max_turns="100" session_dir="" base_url="" bare=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -343,6 +358,7 @@ cmd_launch() {
             --max-turns)   max_turns="$2";   shift 2 ;;
             --session-dir) session_dir="$2"; shift 2 ;;
             --base-url)    base_url="$2";    shift 2 ;;
+            --bare)        bare=true;        shift ;;
             *) _err "未知参数: $1"; exit 1 ;;
         esac
     done
@@ -367,8 +383,16 @@ cmd_launch() {
     # Write state BEFORE starting claude-p so hooks can resolve SESSION_DIR immediately
     _write_state "$session_dir" "pending"
 
-    # Generate session-specific settings (global settings + audit hooks)
-    python3 "$SCRIPT_DIR/gen_settings.py" generate --output "$session_settings"
+    # Write audit metadata as the first event so display.py can show launch params
+    local mode="hooks"
+    [ "$bare" = true ] && mode="bare/stream-json"
+    local meta_ts
+    meta_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    printf '{"ts":"%s","event":"AuditMeta","base_url":"%s","data":{"mode":"%s","model":"%s","max_turns":%s,"bare":%s,"base_url":"%s","repo_root":"%s","prompt_preview":"%s"}}\n' \
+        "$meta_ts" "${base_url}" "$mode" "$model" "$max_turns" "$bare" "${base_url}" \
+        "$(realpath "$repo_root")" \
+        "$(printf '%s' "$prompt" | head -c 100 | tr '"\\' '..')" \
+        >> "$audit_log"
 
     # Save prompt to file to avoid shell injection via special characters
     local prompt_file="$session_dir/prompt.txt"
@@ -390,29 +414,65 @@ cmd_launch() {
 
     _write_state "$session_dir" "$audit_pane"
 
-    # Launch claude -p in background — hooks write to audit.jsonl, display tails it
+    # Launch claude -p in background
     local real_repo_root
     real_repo_root="$(realpath "$repo_root")"
-    (
-        cd "$real_repo_root"
-        export AUDITIT_TARGET=1
-        [ -n "$base_url" ] && export ANTHROPIC_BASE_URL="$base_url"
-        claude -p \
-            --model "$model" \
-            --max-turns "$max_turns" \
-            --permission-mode bypassPermissions \
-            --no-chrome \
-            --settings "$session_settings" \
-            -- "$(cat "$prompt_file")" \
-            > "$session_dir/output.txt" 2>&1
-    ) &
+
+    if [ "$bare" = true ]; then
+        # --bare mode: hooks disabled, use stream-json → stream_to_audit.py
+        _log "Bare 模式：通过 stream-json 采集审计数据"
+        (
+            cd "$real_repo_root"
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+            export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=50000
+            [ -n "$base_url" ] && export ANTHROPIC_BASE_URL="$base_url"
+            claude --bare -p \
+                --model "$model" \
+                --max-turns "$max_turns" \
+                --permission-mode bypassPermissions \
+                --output-format stream-json \
+                --verbose \
+                -- "$(cat "$prompt_file")" \
+                2> "$session_dir/stderr.txt" \
+                | python3 "$SCRIPT_DIR/stream_to_audit.py" "$audit_log"
+            # Also save the final text output
+            python3 -c "
+import json, sys
+for line in open('$audit_log'):
+    obj = json.loads(line)
+    if obj.get('event') == 'SessionEnd':
+        d = obj.get('data', {})
+        print(f'turns={d.get(\"num_turns\",0)} cost=\${d.get(\"total_cost_usd\",0):.4f}')
+" > "$session_dir/output.txt" 2>/dev/null
+        ) &
+    else
+        # Normal mode: hooks write to audit.jsonl
+        python3 "$SCRIPT_DIR/gen_settings.py" generate --output "$session_settings"
+        (
+            cd "$real_repo_root"
+            export AUDITIT_TARGET=1
+            export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+            export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=50000
+            [ -n "$base_url" ] && export ANTHROPIC_BASE_URL="$base_url"
+            claude -p \
+                --model "$model" \
+                --max-turns "$max_turns" \
+                --permission-mode bypassPermissions \
+                --no-chrome \
+                --settings "$session_settings" \
+                -- "$(cat "$prompt_file")" \
+                > "$session_dir/output.txt" 2>&1
+        ) &
+    fi
     local agent_pid=$!
     echo "AGENT_PID=${agent_pid}" >> "$STATE_FILE"
 
     # Focus back to origin
     tmux select-pane -t "$origin_pane"
 
-    _log "已启动 claude -p (model=${model}, max-turns=${max_turns}, pid=${agent_pid})"
+    local mode_label="hooks"
+    [ "$bare" = true ] && mode_label="bare/stream-json"
+    _log "已启动 claude -p (model=${model}, max-turns=${max_turns}, mode=${mode_label}, pid=${agent_pid})"
     [ -n "$base_url" ] && _log "API: ${base_url}"
     _log "Agent 输出将保存至: $session_dir/output.txt"
     _log "完成后运行: bash $0 stop"
@@ -487,9 +547,11 @@ Commands:
       --base-url: sets ANTHROPIC_BASE_URL for the worker process.
       Layout: left=auditor(you) | right-top=AUDIT | right-bottom=WORKER
 
-  launch  --prompt STR [--repo-root DIR] [--model MODEL] [--base-url URL] [--max-turns N]
+  launch  --prompt STR [--repo-root DIR] [--model MODEL] [--base-url URL] [--max-turns N] [--bare]
       Run claude -p in background, single AUDIT pane shows progress.
       --base-url sets ANTHROPIC_BASE_URL for the claude -p process.
+      --bare: use claude --bare (no hooks/skills/plugins); audit data is
+              captured via stream-json output instead of hooks.
       Agent output saved to session-dir/output.txt.
 
   stop
