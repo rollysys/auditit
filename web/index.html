@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Audit Viewer</title>
+<style>
+:root {
+  --bg: #1e1e1e; --fg: #d4d4d4; --bg2: #252526; --bg3: #2d2d2d;
+  --border: #3c3c3c; --blue: #569cd6; --green: #6a9955;
+  --yellow: #dcdcaa; --red: #f44747; --orange: #ce9178;
+  --cyan: #4ec9b0; --gray: #888;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--fg); font-size: 12px; height: 100vh; overflow: hidden; }
+
+/* Header */
+.header { background: var(--bg3); border-bottom: 1px solid var(--border); padding: 4px 12px; display: flex; align-items: center; justify-content: space-between; height: 30px; flex-shrink: 0; }
+.header h1 { font-size: 12px; font-weight: 600; }
+.header button { background: var(--bg2); border: 1px solid var(--border); color: var(--fg); padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+.header button:hover { background: var(--border); }
+
+/* Layout: left sidebar + right detail */
+.layout { display: flex; height: calc(100vh - 30px); }
+
+/* Left: session list */
+.session-list { width: 320px; min-width: 260px; max-width: 400px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; background: var(--bg2); }
+.session-list::-webkit-scrollbar { width: 6px; }
+.session-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+.date-group { border-bottom: 1px solid var(--border); }
+.date-group h2 { font-size: 11px; color: var(--green); padding: 4px 8px; background: var(--bg3); position: sticky; top: 0; }
+.session-item { display: flex; align-items: center; padding: 5px 8px; cursor: pointer; border-bottom: 1px solid transparent; gap: 6px; }
+.session-item:hover { background: var(--bg3); }
+.session-item.active { background: var(--bg3); border-left: 2px solid var(--blue); }
+.session-item .status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.session-item .status.active { background: var(--green); }
+.session-item .status.completed { background: var(--border); }
+.session-item .info { flex: 1; overflow: hidden; }
+.session-item .prompt { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item .meta { font-size: 10px; color: var(--gray); margin-top: 1px; }
+
+/* Right: detail */
+.detail-panel-wrap { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+.detail-panel-wrap.active { display: flex; }
+
+/* Session info bar (compact, top of right side) */
+.session-info-bar { display: flex; align-items: center; gap: 16px; padding: 4px 12px; border-bottom: 1px solid var(--border); background: var(--bg3); font-size: 11px; flex-shrink: 0; flex-wrap: wrap; }
+.session-info-bar .info-item { white-space: nowrap; }
+.session-info-bar .info-item label { color: var(--gray); }
+.session-info-bar .info-item span { color: var(--fg); }
+.session-info-bar .resume-btn { background: var(--bg2); border: 1px solid var(--border); color: var(--fg); padding: 1px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; }
+.session-info-bar .resume-btn:hover { background: var(--border); }
+.session-info-bar .resume-btn.copied { background: var(--green); color: #000; border-color: var(--green); }
+
+/* Empty state */
+.empty-detail { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--gray); font-size: 12px; }
+
+/* Event log */
+.event-log { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+.event-log::-webkit-scrollbar { width: 6px; }
+.event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Event row */
+.event-row { display: flex; align-items: flex-start; padding: 2px 4px; border-radius: 2px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; }
+.event-row:hover { background: var(--bg2); }
+.event-row .ts { color: var(--gray); width: 64px; flex-shrink: 0; font-size: 10px; line-height: 20px; }
+.event-row .icon { width: 16px; flex-shrink: 0; text-align: center; line-height: 20px; font-size: 10px; }
+.event-row .tool-name { width: 140px; flex-shrink: 0; color: var(--yellow); line-height: 20px; }
+.event-row .status-text { flex: 1; color: var(--fg); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-row .actions { flex-shrink: 0; margin-left: 4px; display: flex; gap: 3px; }
+
+/* Tool summary text: path uses per-tool color, preview stays dim */
+.tool-preview    { color: #777; }
+.tool-Read .tool-path       { color: #569cd6; }
+.tool-Grep .tool-path       { color: #c586c0; }
+.tool-Glob .tool-path       { color: #9cdcfe; }
+.tool-Bash .tool-path       { color: #6a9955; }
+.tool-Edit .tool-path       { color: #d7ba7d; }
+.tool-Write .tool-path      { color: #ce9178; }
+.tool-Task .tool-path       { color: #4ec9b0; }
+.tool-NotebookEdit .tool-path { color: #569cd6; }
+.tool-WebFetch .tool-path   { color: #42a5f5; }
+.tool-WebSearch .tool-path  { color: #26a69a; }
+.tool-AskUserQuestion .tool-path { color: #ff7043; }
+
+/* Tool call / result */
+.tool-call .tool-name { color: var(--yellow); }
+.tool-result { opacity: 0.6; }
+.tool-result .tool-name { color: var(--cyan); }
+.tool-result.error .status-text { color: var(--red); }
+
+/* Special events */
+.event-row.session-start { color: var(--cyan); }
+.event-row.user-prompt .status-text { color: var(--orange); }
+.event-row.stop-msg { color: var(--green); border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.event-row.session-end { color: var(--green); border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
+.event-row.subagent-start { color: var(--cyan); }
+.event-row.subagent-stop { color: var(--cyan); border-top: 1px solid var(--border); margin-top: 2px; padding-top: 2px; }
+.event-row.task-event { color: var(--orange); }
+.event-row.notification-event { color: var(--gray); }
+.event-row.perm-event { color: var(--yellow); }
+.event-row.perm-denied-event { color: var(--red); }
+.event-row.stop-fail-event { color: var(--red); border-top: 1px solid var(--border); }
+.event-row.instructions-event { color: var(--gray); }
+.event-row.config-event { color: var(--gray); }
+.event-row.cwd-event { color: var(--gray); }
+.event-row.worktree-event { color: var(--green); }
+.event-row.compact-event { color: var(--gray); }
+.event-row.mcp-event { color: var(--cyan); }
+
+/* Expand button */
+.expand-btn {
+  background: none; border: 1px solid var(--border); color: var(--blue);
+  padding: 0 4px; border-radius: 2px; cursor: pointer; font-size: 9px;
+  font-family: inherit; line-height: 16px; white-space: nowrap;
+}
+.expand-btn:hover { background: var(--border); color: var(--fg); }
+
+/* Collapsible detail panel */
+.detail-content {
+  display: none; margin: 2px 0 4px 80px; padding: 6px 10px;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+  font-size: 10px; line-height: 1.5; max-height: 300px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
+}
+.detail-content.open { display: block; }
+.detail-content.input-panel { color: var(--gray); }
+.detail-content.result-panel { color: var(--fg); }
+.detail-content.error-panel { color: var(--red); }
+
+/* Loading */
+.loading { text-align: center; padding: 30px; color: var(--gray); }
+
+/* Prompt text in info bar */
+.prompt-bar { width: 100%; font-size: 11px; color: var(--orange); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-top: 2px; }
+
+/* Session ID display */
+.session-id { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 10px; user-select: all; }
+.copy-id-btn { background: var(--bg2); border: 1px solid var(--border); color: var(--gray); padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: 4px; }
+.copy-id-btn:hover { background: var(--border); color: var(--fg); }
+.copy-id-btn.copied { background: var(--green); color: #000; border-color: var(--green); }
+.copy-audit-btn { background: var(--bg2); border: 1px solid var(--border); color: var(--fg); padding: 2px 10px; border-radius: 3px; cursor: pointer; font-size: 10px; }
+.copy-audit-btn:hover { background: var(--border); }
+.copy-audit-btn.copied { background: var(--green); color: #000; border-color: var(--green); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Claude Audit Viewer</h1>
+  <div>
+    <button onclick="loadSessions()">↻ Refresh</button>
+  </div>
+</div>
+
+<div class="layout">
+  <!-- Left: Session list -->
+  <div class="session-list" id="sessionList"></div>
+
+  <!-- Right: Detail -->
+  <div class="detail-panel-wrap" id="detailWrap">
+    <div class="session-info-bar" id="infoBar"></div>
+    <div class="event-log" id="eventLog">
+      <div class="empty-detail">← Select a session</div>
+    </div>
+  </div>
+
+  <!-- Right: Empty state (no session selected) -->
+  <div class="detail-panel-wrap" id="emptyWrap" style="display:flex">
+    <div class="empty-detail">← Select a session</div>
+  </div>
+</div>
+
+<script>
+let currentStream = null;
+let allSessions = {};
+let activeSessionId = null;
+let pendingToolCalls = {};
+
+// ========== Session List ==========
+async function loadSessions() {
+  const res = await fetch('/api/sessions');
+  allSessions = await res.json();
+  renderList();
+}
+
+function renderList() {
+  const el = document.getElementById('sessionList');
+  let html = '';
+  for (const [date, sessions] of Object.entries(allSessions)) {
+    html += `<div class="date-group"><h2>${date}</h2>`;
+    for (const s of sessions) {
+      const cost = s.cost ? `$${s.cost.toFixed(3)}` : '';
+      const turns = s.turns ? `${s.turns}t` : '';
+      const dur = s.duration_ms ? `${(s.duration_ms/1000).toFixed(0)}s` : '';
+      const meta = [s.model, turns, cost, dur].filter(Boolean).join(' ');
+      const statusClass = s.status === 'active' ? 'active' : 'completed';
+      const isActive = s.id === activeSessionId ? ' active' : '';
+      html += `<div class="session-item${isActive}" onclick="openSession('${s.date}','${s.id}')">
+        <span class="status ${statusClass}"></span>
+        <div class="info">
+          <div class="prompt" title="${esc(s.prompt)}">${esc(s.prompt) || '<i>no prompt</i>'}</div>
+          <div class="meta">${esc(meta)}</div>
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+  el.innerHTML = html || '<div class="loading">No sessions found</div>';
+}
+
+// ========== Detail View ==========
+function openSession(date, sessionId) {
+  activeSessionId = sessionId;
+  renderList();
+
+  // Switch to detail view
+  document.getElementById('detailWrap').classList.add('active');
+  document.getElementById('emptyWrap').style.display = 'none';
+
+  pendingToolCalls = {};
+  const log = document.getElementById('eventLog');
+  log.innerHTML = '<div class="loading">Loading...</div>';
+
+  loadMeta(date, sessionId);
+  loadEvents(date, sessionId);
+}
+
+async function loadMeta(date, sessionId) {
+  const res = await fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/meta`);
+  const data = await res.json();
+  const infoBar = document.getElementById('infoBar');
+
+  const m = data.metadata || {};
+  const s = data.summary || {};
+  const safeCwd = (m.cwd || '').replace(/'/g, "\\'");
+  const cost = s.total_cost_usd != null ? `$${s.total_cost_usd.toFixed(4)}` : '';
+  const turns = s.num_turns || 0;
+  const dur = s.duration_ms ? (s.duration_ms / 1000).toFixed(1) + 's' : '';
+  const auditPath = `~/.claude-audit/${date}/${sessionId}/audit.jsonl`;
+
+  infoBar.innerHTML = `
+    <div class="info-item"><label>ID: </label><span class="session-id">${esc(sessionId)}</span><button class="copy-id-btn" onclick="copySessionId(this, '${esc(sessionId)}')">复制</button></div>
+    <button class="copy-audit-btn" onclick="copyAuditPath(this, '${date}', '${esc(sessionId)}', '${auditPath}')">📄 审计路径</button>
+    <div class="info-item"><label>Model: </label><span>${esc(m.model || s.model || '—')}</span></div>
+    <div class="info-item"><label>Turns: </label><span>${turns}</span></div>
+    <div class="info-item"><label>Cost: </label><span>${cost}</span></div>
+    <div class="info-item"><label>Duration: </label><span>${dur}</span></div>
+    <div class="info-item"><label>Status: </label><span>${esc(s.reason || 'active')}</span></div>
+    <button class="resume-btn" onclick="copyResume(this, '${sessionId}', '${safeCwd}')">📋 Resume</button>
+    <div class="prompt-bar" title="${esc(m.prompt || '')}">${esc(m.prompt || '—')}</div>
+  `;
+}
+
+function copySessionId(btn, sessionId) {
+  navigator.clipboard.writeText(sessionId).then(() => {
+    btn.textContent = '✓';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function copyAuditPath(btn, date, sessionId, auditPath) {
+  const text = `请审计以下 session：\n审计日志：${auditPath}\nSession ID: ${sessionId}\n日期：${date}`;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = '✓ 已复制';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '📄 审计路径'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+function copyResume(btn, sessionId, cwd) {
+  const cmd = `cd "${cwd}" && claude --resume ${sessionId}`;
+  navigator.clipboard.writeText(cmd).then(() => {
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = '📋 Resume'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+// ========== Events (SSE) ==========
+function loadEvents(date, sessionId) {
+  if (currentStream) { currentStream.close(); currentStream = null; }
+  const log = document.getElementById('eventLog');
+
+  fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/events`)
+    .then(r => r.json())
+    .then(events => {
+      log.innerHTML = '';
+      pendingToolCalls = {};
+      events.forEach(e => processEvent(e, log));
+    })
+    .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
+
+  const evtSource = new EventSource(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/stream`);
+  currentStream = evtSource;
+
+  evtSource.addEventListener('event', (e) => {
+    if (e.data === '__DONE__' || e.data === '__GZ__') {
+      evtSource.close(); currentStream = null;
+      return;
+    }
+    try {
+      processEvent(JSON.parse(e.data), log);
+      log.scrollTop = log.scrollHeight;
+    } catch {}
+  });
+  evtSource.onerror = () => { evtSource.close(); currentStream = null; };
+}
+
+function processEvent(event, container) {
+  const ev = event.event;
+  const d = event.data || {};
+  const ts = event.ts ? formatLocalTime(event.ts) : '';
+
+  switch (ev) {
+    case 'PreToolUse':          renderToolCall(ts, d, container); break;
+    case 'PostToolUse':
+    case 'PostToolUseFailure':  renderToolResult(ts, d, ev === 'PostToolUseFailure', container); break;
+    case 'SessionStart':        renderSessionStart(ts, d, container); break;
+    case 'UserPromptSubmit':    renderUserPrompt(ts, d, container); break;
+    case 'PermissionRequest':   renderPermissionRequest(ts, d, container); break;
+    case 'PermissionDenied':    renderPermissionDenied(ts, d, container); break;
+    case 'Stop':                renderStop(ts, d, container); break;
+    case 'StopFailure':         renderStopFailure(ts, d, container); break;
+    case 'SessionEnd':          renderSessionEnd(ts, d, container); break;
+    case 'SubagentStart':       renderSubagentStart(ts, d, container); break;
+    case 'SubagentStop':        renderSubagentStop(ts, d, container); break;
+    case 'TaskCreated':         renderTaskCreated(ts, d, container); break;
+    case 'TaskCompleted':       renderTaskCompleted(ts, d, container); break;
+    case 'Notification':        renderNotification(ts, d, container); break;
+    case 'InstructionsLoaded':  renderInstructionsLoaded(ts, d, container); break;
+    case 'ConfigChange':        renderConfigChange(ts, d, container); break;
+    case 'CwdChanged':          renderCwdChanged(ts, d, container); break;
+    case 'WorktreeCreate':      renderWorktreeCreate(ts, d, container); break;
+    case 'WorktreeRemove':      renderWorktreeRemove(ts, d, container); break;
+    case 'PreCompact':          renderPreCompact(ts, d, container); break;
+    case 'PostCompact':         renderPostCompact(ts, d, container); break;
+    case 'Elicitation':         renderElicitation(ts, d, container); break;
+    case 'ElicitationResult':   renderElicitationResult(ts, d, container); break;
+  }
+}
+
+function renderSessionStart(ts, d, container) {
+  container.append(makeRow(ts, '⚙', 'SESSION', `START ${esc(d.model||'')} ${esc((d.session_id||d.sessionId||'').substring(0,8))}`, 'session-start'));
+}
+
+function renderUserPrompt(ts, d, container) {
+  const p = d.prompt || '';
+  const truncated = p.length > 300 ? p.substring(0, 300) : p;
+  const row = makeRow(ts, '👤', 'USER', esc(truncated), 'user-prompt', p);
+
+  if (p.length > 300) {
+    const actions = row.querySelector('.actions');
+    const panel = document.createElement('div');
+    panel.className = 'detail-content input-panel';
+    panel.textContent = p;
+
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.textContent = 'full';
+    btn.onclick = () => {
+      const open = panel.classList.toggle('open');
+      btn.textContent = open ? 'hide' : 'full';
+    };
+    actions.appendChild(btn);
+    container.appendChild(row);
+    container.appendChild(panel);
+  } else {
+    container.appendChild(row);
+  }
+}
+
+function renderToolCall(ts, d, container) {
+  const toolName = d.tool_name || '?';
+  const toolUseId = d.tool_use_id || '';
+  const input = d.tool_input ? JSON.stringify(d.tool_input, null, 2) : '';
+
+  const row = makeRow(ts, '🔧', toolName, '', 'tool-call');
+  row.classList.add('tool-' + toolName);
+
+  // Expand button for input
+  const actions = row.querySelector('.actions');
+  const inputPanel = document.createElement('div');
+  inputPanel.className = 'detail-content input-panel';
+  inputPanel.textContent = input;
+
+  const btn = document.createElement('button');
+  btn.className = 'expand-btn';
+  btn.textContent = 'input';
+  btn.onclick = () => {
+    const open = inputPanel.classList.toggle('open');
+    btn.textContent = open ? 'hide' : 'input';
+  };
+  actions.appendChild(btn);
+
+  container.appendChild(row);
+  container.appendChild(inputPanel);
+
+  if (toolUseId) {
+    pendingToolCalls[toolUseId] = { row, input, inputPanel, inputBtn: btn };
+  }
+}
+
+// ========== Tool result summary ==========
+function toolSummary(toolName, input, response, isError) {
+  if (isError) {
+    const err = typeof response === 'string' ? response.substring(0, 120) : JSON.stringify(response).substring(0, 120);
+    return `error: ${esc(err)}`;
+  }
+
+  const respStr = typeof response === 'string' ? response : JSON.stringify(response, null, 2);
+
+  switch (toolName) {
+    case 'Read': {
+      const path = (input?.file_path || input?.path || '');
+      const lines = (input?.offset != null) ? ` (L${input.offset+1}-)` : '';
+      const preview = respStr.substring(0, 150);
+      return `<span class="tool-path">${esc(path)}${lines}</span> → <span class="tool-preview">${esc(preview)}</span>`;
+    }
+    case 'Grep': {
+      const pattern = input?.pattern || '';
+      const path = input?.path || '';
+      const firstLine = respStr.split('\n').find(l => l.trim()) || '';
+      return `<span class="tool-path">pattern: ${esc(pattern)} ${esc(path)}</span> → <span class="tool-preview">${esc(firstLine.substring(0, 120))}</span>`;
+    }
+    case 'Glob': {
+      const pattern = input?.pattern || '';
+      const count = respStr.split('\n').filter(l => l.trim()).length;
+      const firstFile = respStr.split('\n').find(l => l.trim()) || '';
+      return `<span class="tool-path">${count} files matching ${esc(pattern)}</span> → <span class="tool-preview">${esc(firstFile.substring(0, 100))}</span>`;
+    }
+    case 'Bash': {
+      const cmd = input?.command || '';
+      const preview = respStr.substring(0, 120);
+      return `<span class="tool-path">$ ${esc(cmd)}</span> → <span class="tool-preview">${esc(preview)}</span>`;
+    }
+    case 'Edit': {
+      const path = input?.file_path || input?.path || '';
+      const preview = respStr.substring(0, 120);
+      return `<span class="tool-path">${esc(path)}</span> → <span class="tool-preview">${esc(preview)}</span>`;
+    }
+    case 'Write': {
+      const path = input?.file_path || input?.path || '';
+      return `<span class="tool-path">${esc(path)}</span> <span class="tool-preview">(${respStr.length.toLocaleString()} bytes)</span>`;
+    }
+    case 'Task':
+    case 'SubagentStart':
+    case 'SubagentStop': {
+      const preview = respStr.substring(0, 120);
+      return preview ? `<span class="tool-preview">${esc(preview)}</span>` : '';
+    }
+    default: {
+      const preview = respStr.substring(0, 120);
+      return preview ? `<span class="tool-preview">${esc(preview)}</span>` : `${respStr.length.toLocaleString()} chars`;
+    }
+  }
+}
+
+function renderToolResult(ts, d, isError, container) {
+  const toolName = d.tool_name || '?';
+  const toolUseId = d.tool_use_id || '';
+  const pending = pendingToolCalls[toolUseId] || null;
+
+  const response = d.tool_response !== undefined ? d.tool_response : (d.error || '');
+  const respStr = typeof response === 'string' ? response : JSON.stringify(response, null, 2);
+
+  // Generate summary text
+  const summaryHtml = toolSummary(toolName, pending?.input ? JSON.parse(pending.input) : d.tool_input || {}, response, isError);
+
+  if (pending) {
+    // Update the existing tool call row — no new row
+    pending.row.className = 'event-row tool-result tool-' + toolName + (isError ? ' error' : '');
+    pending.row.querySelector('.icon').textContent = isError ? '❌' : '✔';
+    pending.row.querySelector('.tool-name').style.color = isError ? 'var(--red)' : 'var(--yellow)';
+    pending.row.querySelector('.status-text').innerHTML = summaryHtml;
+    pending.row.querySelector('.status-text').style.color = isError ? 'var(--red)' : 'var(--fg)';
+    pending.row.querySelector('.status-text').style.whiteSpace = 'normal';
+
+    // Replace 'input' button with 'full' button
+    const actions = pending.row.querySelector('.actions');
+    actions.innerHTML = '';
+
+    const resultPanel = document.createElement('div');
+    resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
+    resultPanel.textContent = respStr;
+
+    const rbtn = document.createElement('button');
+    rbtn.className = 'expand-btn';
+    rbtn.textContent = 'full';
+    rbtn.onclick = () => {
+      const open = resultPanel.classList.toggle('open');
+      rbtn.textContent = open ? 'hide' : 'full';
+    };
+    actions.appendChild(rbtn);
+
+    // Insert result panel after the row
+    pending.row.after(resultPanel);
+
+    delete pendingToolCalls[toolUseId];
+  } else {
+    // No matching pending call — standalone result
+    const resultRow = makeRow(ts, isError ? '❌' : '✔', toolName, summaryHtml, 'tool-result tool-' + toolName + (isError ? ' error' : ''));
+    resultRow.style.opacity = '0.5';
+    resultRow.querySelector('.status-text').style.whiteSpace = 'normal';
+
+    const resultPanel = document.createElement('div');
+    resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
+    resultPanel.textContent = respStr;
+
+    const rbtn = document.createElement('button');
+    rbtn.className = 'expand-btn';
+    rbtn.textContent = 'full';
+    rbtn.onclick = () => resultPanel.classList.toggle('open');
+    resultRow.querySelector('.actions').appendChild(rbtn);
+
+    container.appendChild(resultRow);
+    container.appendChild(resultPanel);
+  }
+}
+
+function renderStop(ts, d, container) {
+  const msg = d.last_assistant_message || '';
+  const truncated = msg.length > 200 ? msg.substring(0, 200) : msg;
+  const row = makeRow(ts, '🏁', 'STOP', esc(truncated), 'stop-msg', msg);
+
+  if (msg.length > 200) {
+    const actions = row.querySelector('.actions');
+    const panel = document.createElement('div');
+    panel.className = 'detail-content input-panel';
+    panel.textContent = msg;
+
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.textContent = 'full';
+    btn.onclick = () => {
+      const open = panel.classList.toggle('open');
+      btn.textContent = open ? 'hide' : 'full';
+    };
+    actions.appendChild(btn);
+    container.appendChild(row);
+    container.appendChild(panel);
+  } else {
+    container.appendChild(row);
+  }
+}
+
+function renderSessionEnd(ts, d, container) {
+  const cost = (d.total_cost_usd||0).toFixed(4);
+  const turns = d.num_turns||0;
+  const dur = d.duration_ms ? (d.duration_ms/1000).toFixed(1)+'s' : '';
+  container.append(makeRow(ts, '🏁', 'END', `${esc(d.reason||'')} | ${turns}t | $${cost} ${dur}`, 'session-end'));
+}
+
+function renderSubagentStart(ts, d, container) {
+  const agentType = d.agent_type || d.tool_name || 'agent';
+  const desc = d.description || d.prompt || '';
+  const text = `${esc(agentType)} ${esc(desc.substring(0, 150))}`;
+  container.append(makeRow(ts, '🤖', 'AGENT', text, 'subagent-start', text));
+}
+
+function renderSubagentStop(ts, d, container) {
+  const agentType = d.agent_type || d.tool_name || 'agent';
+  const msg = (d.last_assistant_message || d.reason || '').substring(0, 150);
+  container.append(makeRow(ts, '🤖', 'AGENT DONE', `${esc(agentType)} — ${esc(msg)}`, 'subagent-stop', msg));
+}
+
+function renderTaskCreated(ts, d, container) {
+  const subject = d.subject || '';
+  const desc = d.description || '';
+  const text = `${esc(subject)} — ${esc(desc.substring(0, 150))}`;
+  container.append(makeRow(ts, '📋', 'TASK', text, 'task-event', text));
+}
+
+function renderTaskCompleted(ts, d, container) {
+  const subject = d.subject || '';
+  container.append(makeRow(ts, '✅', 'TASK DONE', esc(subject), 'task-event'));
+}
+
+function renderNotification(ts, d, container) {
+  const type = d.notification_type || d.type || '';
+  const msg = d.message || '';
+  container.append(makeRow(ts, '🔔', 'NOTIFY', `${esc(type)}: ${esc(msg.substring(0, 150))}`, 'notification-event', msg));
+}
+
+// ========== New event renderers ==========
+
+function renderPermissionRequest(ts, d, container) {
+  const tool = d.tool_name || '?';
+  const input = d.tool_input ? JSON.stringify(d.tool_input, null, 2) : '';
+  const text = `${esc(tool)}: ${esc(input.substring(0, 150))}`;
+  container.append(makeRow(ts, '❓', 'PERM', text, 'perm-event', input));
+}
+
+function renderPermissionDenied(ts, d, container) {
+  const tool = d.tool_name || '?';
+  const reason = d.reason || d.last_assistant_message || '';
+  const text = `${esc(tool)} — ${esc(reason.substring(0, 150))}`;
+  container.append(makeRow(ts, '🚫', 'DENIED', text, 'perm-denied-event', reason));
+}
+
+function renderStopFailure(ts, d, container) {
+  const reason = d.error_type || d.error || '';
+  const msg = d.message || '';
+  const text = `${esc(reason)}: ${esc(msg.substring(0, 200))}`;
+  container.append(makeRow(ts, '⚠️', 'STOP FAIL', text, 'stop-fail-event', `${reason} ${msg}`));
+}
+
+function renderInstructionsLoaded(ts, d, container) {
+  const paths = (d.paths || []).join(', ');
+  const reason = d.reason || '';
+  const text = paths ? `${esc(paths)}` : `${esc(reason)}`;
+  container.append(makeRow(ts, '📄', 'INSTR', text, 'instructions-event', text));
+}
+
+function renderConfigChange(ts, d, container) {
+  const source = d.source || '';
+  const paths = (d.paths || []).join(', ');
+  container.append(makeRow(ts, '⚙', 'CONFIG', `${esc(source)}: ${esc(paths)}`, 'config-event'));
+}
+
+function renderCwdChanged(ts, d, container) {
+  const cwd = d.cwd || '';
+  container.append(makeRow(ts, '📂', 'CWD', esc(cwd), 'cwd-event'));
+}
+
+function renderWorktreeCreate(ts, d, container) {
+  const path = d.path || '';
+  const branch = d.branch || '';
+  container.append(makeRow(ts, '🌿', 'WTREE', `${esc(path)} (${esc(branch)})`, 'worktree-event'));
+}
+
+function renderWorktreeRemove(ts, d, container) {
+  const path = d.path || '';
+  container.append(makeRow(ts, '🌿', 'WTREE ✕', esc(path), 'worktree-event'));
+}
+
+function renderPreCompact(ts, d, container) {
+  const trigger = d.trigger || '';
+  const before = d.tokens_before || '?';
+  const text = `${esc(trigger)} — ${before} tokens before compaction`;
+  container.append(makeRow(ts, '📦', 'COMPACT', text, 'compact-event'));
+}
+
+function renderPostCompact(ts, d, container) {
+  const trigger = d.trigger || '';
+  const after = d.tokens_after || '?';
+  const text = `${esc(trigger)} — ${after} tokens after compaction`;
+  container.append(makeRow(ts, '📦✓', 'COMPACT', text, 'compact-event'));
+}
+
+function renderElicitation(ts, d, container) {
+  const server = d.mcp_server_name || d.server || '';
+  const prompt = d.prompt || d.request || '';
+  const text = `${esc(server)}: ${esc(prompt.substring(0, 150))}`;
+  container.append(makeRow(ts, '💬', 'MCP', text, 'mcp-event', prompt));
+}
+
+function renderElicitationResult(ts, d, container) {
+  const server = d.mcp_server_name || d.server || '';
+  const action = d.action || d.response || '';
+  container.append(makeRow(ts, '💬✓', 'MCP OK', `${esc(server)}: ${esc(JSON.stringify(action).substring(0, 150))}`, 'mcp-event'));
+}
+
+function makeRow(ts, icon, toolName, statusText, cls, title) {
+  const row = document.createElement('div');
+  row.className = 'event-row ' + cls;
+  row.innerHTML = `
+    <span class="ts">${ts}</span>
+    <span class="icon">${icon}</span>
+    <span class="tool-name">${esc(toolName)}</span>
+    <span class="status-text">${statusText}</span>
+    <span class="actions"></span>
+  `;
+  if (title) row.querySelector('.status-text').title = title;
+  return row;
+}
+
+function esc(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function formatLocalTime(isoTs) {
+  // Convert "2026-04-11T08:23:48Z" → "16:23:48" (local timezone)
+  const d = new Date(isoTs);
+  return d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// ========== Init ==========
+loadSessions();
+</script>
+</body>
+</html>

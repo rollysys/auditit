@@ -1,289 +1,178 @@
 # auditit
 
-**Claude Code 会话实时审计监控工具。**
+**全局 Claude Code 会话审计系统。**
 
-在 tmux 旁观窗格中实时展示任意 Claude Code 会话的完整执行过程 —— 提示词、工具调用、工具结果、助手输出、Token 用量、上下文压力、成本，以及**完整的 sub-agent 调用树** —— 全程不修改你的全局 `~/.claude/settings.json`。
-
-```
-┌──────────────────────┬──────────────────────────────┐
-│                      │  ═══ AUDITIT ═══             │
-│  AUDITOR             │  mode=model │ model=sonnet   │
-│  (你的 claude，      │  ───────────────              │
-│   不被审计，         │  14:32:48  ⚙ SESSION START   │
-│   用于查看日志、     │  14:32:48  👤 重构 parser... │
-│   复盘、提问)        │  14:32:51  📖 Read ...       │
-│                      │  14:32:52  ┌ 🤖 SUBAGENT    │
-│                      │  14:32:53  │  🔍 Grep ...   │
-│                      │  14:32:55  └ ✔ turns=2      │
-│                      ├──────────────────────────────┤
-│                      │  WORKER (sonnet)             │
-│                      │  AUDITIT_TARGET=1 claude ... │
-└──────────────────────┴──────────────────────────────┘
-```
-
----
-
-## 两种审计后端
-
-auditit 支持两种数据采集方式，产出**格式相同的 `audit.jsonl`**，display / replay / report 通用：
-
-### hooks 后端（默认）
-
-通过 `settings.json` 注入 hook 脚本，每次工具调用触发 `audit_hook.sh` 写入 JSONL。
-
-- **注入方式**：`--settings`（单进程）或 `CLAUDE_CONFIG_DIR`（多进程）
-- **进程隔离**：`AUDITIT_TARGET=1` 环境变量门禁
-- **sub-agent 树**：完整（SubagentStart / SubagentStop 事件）
-- **限制**：`--bare` 模式下 hooks 被跳过，无法使用
-
-| Hook 事件 | 采集内容 |
-|---|---|
-| `SessionStart` | `session_id`、模型、`cwd` |
-| `UserPromptSubmit` | 完整用户输入 |
-| `PreToolUse` / `PostToolUse` | 工具名、入参、返回、`agent_id` |
-| `Stop` | 助手最终消息、token 统计、cost |
-| `SessionEnd` | 总 token / cost / 轮次 / 耗时 |
-| `SubagentStart` / `SubagentStop` | 父子 `agent_id`、最终输出、transcript 路径 |
-
-### stream-json 后端（bare 模式）
-
-通过 `claude --output-format stream-json --verbose` 的 stdout 输出，由 `stream_to_audit.py` 转写为 audit.jsonl 格式。
-
-- **注入方式**：PATH wrapper 自动为所有 `claude` 命令附加参数（用户可 override）
-- **进程隔离**：`CLAUDE_CODE_SIMPLE=1` 环境变量继承
-- **sub-agent 树**：无（单进程视角，bare 模式不派生 sub-agent）
-- **适用场景**：需要最轻量启动（跳过 hooks / skills / plugins / memory 等）
-
----
-
-## 进程隔离
-
-### hooks 模式
-
-两层隔离保证**只有你想审计的进程会写日志**：
-
-1. **Per-session settings**：`gen_settings.py` 生成仅含 audit hooks 的 `settings.json`（不继承全局 settings），通过 `--settings` 作为 flagSettings 加载。Claude Code 运行时合并所有 settings source（flag / user / project / local），hooks 不会重复。
-2. **`AUDITIT_TARGET=1` 门禁**：`audit_hook.sh` 检查该变量，没设就 `exit 0`。审计器自身的 claude 永远不写日志。
-
-### 多进程覆盖（`--command` 模式）
-
-`--settings` 是 CLI 参数，无法通过环境变量继承。`--command` 模式通过 `CLAUDE_CONFIG_DIR` 解决：
-
-1. 创建临时 config 目录，将 `~/.claude/*` 全部 symlink，**只替换 `settings.json`**
-2. `export CLAUDE_CONFIG_DIR=<临时目录>` —— 子进程自动继承
-3. 配合 `AUDITIT_TARGET=1`，脚本内任意深度的 claude 进程都写入同一份 `audit.jsonl`
-
-### bare 模式
-
-`--bare` 设置 `CLAUDE_CODE_SIMPLE=1`，跳过 hooks / skills / plugins / memory / LSP / GrowthBook 等约 30 项功能。审计通过 stream-json 后端实现。多进程场景使用 PATH wrapper 自动注入 `--output-format stream-json --verbose`，用户显式传参可 override（commander 后者覆盖前者）。
-
----
-
-## 前置依赖
-
-- `tmux` ≥ 3.0
-- `python3` + `rich`（`pip install rich`）
-- `claude` CLI（已登录）
-
-缺任一项会直接报错退出，不会自动安装。
-
----
-
-## 安装
-
-作为 Claude Code skill：
-
-```bash
-git clone https://github.com/rollysys/auditit.git ~/.claude/skills/auditit
-```
-
-或者 clone 到任意位置，直接调用 `scripts/workbench.sh`。
-
----
-
-## 启动模式
-
-### `start`（交互式 tmux 布局）
+一个常驻的旁观者：通过 Claude Code 的 hook 机制被动采集每一次会话的 prompt、
+工具调用、sub-agent、token 与成本，按日期/session 分层落盘，供 Web UI 实时查
+看或离线交给 Claude 自己分析。
 
 ```
-布局: AUDITOR │ AUDIT + WORKER
-结束: 手动 stop
+~/.claude/settings.json           ──┐  install.py 一次性注入
+                                    │  所有 Claude 会话自动被审
+┌───────────────────────────────────┴──┐
+│  hook.sh  (每次 hook 事件触发)        │
+│    ↓                                  │
+│  ~/.claude-audit/YYYY-MM-DD/<sid>/    │
+│    audit.jsonl                        │  追加写
+│    audit.jsonl.gz    (SessionEnd 后)   │  原子压缩 + 行数校验
+│    summary.json                       │  SessionEnd 时生成
+│    metadata.json                      │  server 首次解析后缓存
+└───────────────────────────────────────┘
+              │
+              ▼
+       server.py  :8765         SSE 实时 tail
+              │
+              ▼
+       web/index.html          按日期分组 | 工具调用折叠 | 审计路径一键拷贝
 ```
-
-```bash
-SKILL_DIR="$HOME/.claude/skills/auditit/scripts"
-
-# 单个 claude worker
-bash "$SKILL_DIR/workbench.sh" start --model sonnet
-
-# 任意命令（子 claude 自动被审计）
-bash "$SKILL_DIR/workbench.sh" start --command 'bash my_script.sh'
-
-# 任意命令 + 指定 sub-agent 默认模型
-bash "$SKILL_DIR/workbench.sh" start --command 'bash my_script.sh' --model kimi-k2.5
-
-# 手动模式（打印 hint，用户自己起 claude）
-bash "$SKILL_DIR/workbench.sh" start
-
-# 指定自定义 API endpoint
-bash "$SKILL_DIR/workbench.sh" start --model sonnet --base-url https://my-proxy.example.com/v1
-```
-
-### `launch`（headless 后台任务）
-
-```
-布局: 原 pane │ AUDIT
-结束: SessionEnd 自动退出
-```
-
-```bash
-# 单次任务（hooks 审计）
-bash "$SKILL_DIR/workbench.sh" launch --prompt '分析错误处理' --model sonnet
-
-# 单次任务（bare 模式，stream-json 审计）
-bash "$SKILL_DIR/workbench.sh" launch --prompt '分析错误处理' --model sonnet --bare
-
-# 任意命令（hooks 审计，CLAUDE_CONFIG_DIR）
-bash "$SKILL_DIR/workbench.sh" launch --command 'bash my_script.sh'
-
-# 任意命令 + bare（stream-json，PATH wrapper）
-bash "$SKILL_DIR/workbench.sh" launch --command 'bash my_script.sh' --bare
-```
-
-### `replay`（离线回放）
-
-两种后端产出的 `audit.jsonl` 格式相同，replay 通用。
-
-```bash
-bash "$SKILL_DIR/workbench.sh" replay /path/to/audit.jsonl
-```
-
-### 其他命令
-
-```bash
-bash "$SKILL_DIR/workbench.sh" stop                    # 关闭 audit + worker 窗格
-bash "$SKILL_DIR/workbench.sh" status                  # 查看当前会话状态
-bash "$SKILL_DIR/workbench.sh" report                  # 生成 Markdown 分析报告
-```
-
----
-
-## model 配置
-
-| 参数 | 作用 | 影响范围 |
-|---|---|---|
-| `--model MODEL` | claude CLI 的 `--model` 参数 | 主进程 |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | sub-agent 默认 sonnet 模型 | 全进程树（自动注入） |
-| `--base-url URL` | `ANTHROPIC_BASE_URL` 环境变量 | 全进程树（自动注入） |
-
-`--model` 在 `--command` 模式下仅注入 `ANTHROPIC_DEFAULT_SONNET_MODEL` 环境变量，不控制主进程启动命令。
-
----
-
-## 环境变量注入矩阵
-
-| 变量 | start --model | start --command | launch --prompt | launch --bare | launch --command | launch --command --bare |
-|---|---|---|---|---|---|---|
-| `AUDITIT_TARGET=1` | ✓ | ✓ | ✓ | — | ✓ | — |
-| `CLAUDE_CONFIG_DIR` | — | ✓ | — | — | ✓ | — |
-| `CLAUDE_CODE_SIMPLE=1` | — | — | — | ✓ | — | ✓ |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | ✓ | 可选 | ✓ | ✓ | 可选 | 可选 |
-| `ANTHROPIC_BASE_URL` | 可选 | 可选 | 可选 | 可选 | 可选 | 可选 |
-| `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `--settings` | ✓ | — | ✓ | — | — | — |
-| PATH wrapper | — | — | — | — | — | ✓ |
-
----
-
-## Audit 面板
-
-audit pane 启动时首先显示本次审计参数：
-
-```
-═══ AUDITIT ═══
-  mode=bare/stream-json  │  model=kimi-k2.5  │  max_turns=50  │  bare
-  api=https://my-proxy.example.com/v1  │  cwd=/Users/x/myproject
-  prompt=分析 parser.cpp 的错误处理逻辑
-───────────────
-```
-
-随后实时渲染事件流，sub-agent 按嵌套深度缩进：
-
-```
-14:32:48  ⚙  SESSION START  abc123
-14:32:48  👤 USER  │  重构 parser.cpp 的错误处理
-14:32:51  📖 Read  src/parser.cpp  →  ✔  234 lines
-14:32:52  ┌ 🤖 SUBAGENT  depth=1  id=a1b2c3d4
-14:32:53  │  🔍 Grep  "TODO"  →  ✔  5 matches
-14:32:55  └ 🤖 SUBAGENT STOP  ✔  turns=2  $0.0018
-14:32:56  🏁 STOP  │  重构完成
-         💰 $0.0312  │  tools:6  │  sub-agents:1
-📊 SUMMARY  │  turns=4  │  tools=6  │  ctx=38%  │  api=https://...
-```
-
-### 按 session 过滤
-
-```bash
-python3 scripts/display.py --replay audit.jsonl --session-id 1fa96f8c
-```
-
----
-
-## 会话数据
-
-所有数据落盘在 `/tmp/auditit/`（可用 `AUDITIT_DIR` 覆盖）：
-
-```
-/tmp/auditit/
-├── current.state                # 当前活跃会话状态（session dir + pane id）
-└── session-20260405-143652/
-    ├── audit.jsonl              # 所有审计事件（append-only JSONL）
-    ├── settings.json            # 本次会话 audit hooks（仅 hooks 模式）
-    ├── config/                  # CLAUDE_CONFIG_DIR symlink 目录（仅 --command 模式）
-    ├── prompt.txt               # 用户 prompt（仅 launch 模式）
-    ├── output.txt               # claude 输出
-    ├── stderr.txt               # stderr 输出（仅 bare 模式）
-    └── report.md                # 收尾生成的分析报告
-```
-
-`audit.jsonl` 是唯一的事实来源，display、replay、report 全部从它派生。
-
----
-
-## 项目结构
-
-```
-auditit/
-├── SKILL.md                     # Claude Code skill manifest
-├── design.md                    # 详细设计文档（中文）
-├── hooks/
-│   └── audit_hook.sh            # AUDITIT_TARGET 门禁 → 写 JSONL + 采集 ANTHROPIC_BASE_URL
-└── scripts/
-    ├── workbench.sh             # 入口：tmux 编排（start/stop/launch/replay/report/status）
-    ├── gen_settings.py          # 生成仅含 audit hooks 的 settings.json（不继承全局配置）
-    ├── display.py               # 实时树状渲染（AuditMeta / sub-agent 嵌套 / cost / ctx pressure）
-    ├── stream_to_audit.py       # stream-json → audit.jsonl 转换器（bare 模式）
-    ├── render_events.py         # 事件到终端行的渲染层
-    ├── worker.py                # 托管 worker 进程管理
-    ├── analyzer.py              # 收尾报告生成器
-    └── util.py                  # 公共工具
-```
-
----
 
 ## 设计原则
 
-- **被动只读**：audit 窗格绝不对 worker 进程产生任何副作用。
-- **进程隔离**：全局 settings 零修改，双层门禁（per-session settings + env var）。
-- **双后端统一**：hooks 和 stream-json 产出相同格式的 `audit.jsonl`，上层通用。
-- **Fail fast**：依赖缺失直接报错退出，不自动修复。
-- **单一数据源**：所有视图（live / replay / report）都从同一份 `audit.jsonl` 派生，可复现。
-- **可 override**：`CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` 覆盖远程下发的 Read 限制；PATH wrapper 的参数可被用户显式传参覆盖。
+| 原则 | 说明 |
+|---|---|
+| **被动只读** | hook 从不阻塞、不修改 Claude 行为，只追加日志 |
+| **天然隔离** | 按 `session_id` 分目录，多会话并发无需锁 |
+| **零工作流扭曲** | install 一次之后，所有 `claude` 命令自动被审 |
+| **单一事实源** | 所有视图（live / replay / 离线分析）都从同一份 `audit.jsonl` 派生 |
+| **安全可回滚** | install.py 写 settings.json 前自动备份 + 原子写 + rollback |
+| **手动驱动分析** | 需要审计时把 `~/.claude-audit/<date>/<sid>/audit.jsonl` 路径贴给 Claude 自己解读 |
 
-更多架构细节见 [`design.md`](design.md)。
+## 前置依赖
 
----
+- Claude Code (已登录，`~/.claude/` 存在)
+- `python3` (标准库即可，无第三方依赖)
+- `bash`
+
+缺任一项 `install.py doctor` 会直接报错。
+
+## 安装
+
+```bash
+git clone <this-repo> ~/src/auditit
+cd ~/src/auditit
+python3 install.py doctor     # pre-flight 检查
+python3 install.py install    # 写入 ~/.claude/settings.json
+```
+
+install.py 会：
+1. 运行 pre-flight（Claude 配置目录、settings.json 合法性、hook.sh 可执行、bash 可用）
+2. 把当前 `~/.claude/settings.json` 备份到带时间戳的 `.bak` 文件
+3. 用 tmp + `os.replace` 原子写入新 settings.json
+4. 写入前加 `fcntl` 独占锁，防止两个 installer 并发
+5. 每条 hook 命令里埋入 marker `# auditit`，后续 `uninstall`/`status` 靠
+   marker 识别 —— 即使你把仓库移到别的路径，卸载仍然有效
+
+## 使用
+
+### 查看
+
+启动 Web UI：
+
+```bash
+python3 server.py
+# → http://127.0.0.1:8765
+```
+
+- 左侧按日期分组列出所有 session（点一下即可展开事件流）
+- 右侧顶部有 **📄 审计路径** 按钮：一键拷贝「请审计以下 session：\n审计日志：`~/.claude-audit/.../audit.jsonl`」到剪贴板，直接粘给另一个 Claude 做离线分析
+- **📋 Resume** 按钮：拷贝 `cd <cwd> && claude --resume <sid>` 方便恢复会话
+- 活跃 session 走 SSE live tail；已 gzip 的历史 session 一次性回放
+
+### 离线交给 Claude 分析
+
+最简工作流：
+
+1. 在 Web UI 上挑一个 session，点 **📄 审计路径**
+2. 粘贴到任意 Claude 会话
+3. Claude 读 jsonl 做针对性分析（成本优化、工具重复、sub-agent 委派是否合理等）
+
+不做预设模板 —— 每次分析目标不同，交给 LLM 临场决定比固定 Markdown 报告更灵活。
+
+### 卸载
+
+```bash
+python3 install.py uninstall           # 真卸载
+python3 install.py uninstall --dry-run # 预览
+python3 install.py status              # 查看哪些事件被注册
+```
+
+卸载只动 settings.json 里含 marker 的条目，不会碰你自定义的其他 hook。带时间
+戳的 `.bak` 文件保留，需要时手动删。
+
+## 数据模型
+
+### 目录结构
+
+```
+~/.claude-audit/
+├── 2026-04-11/
+│   ├── 097a326c-d56a-46f7-ac63-e6fb0cbfab29/
+│   │   ├── audit.jsonl          # 活跃会话 / 未压缩
+│   │   ├── audit.jsonl.gz       # SessionEnd 后原子压缩
+│   │   ├── summary.json         # SessionEnd 生成：cost, turns, duration
+│   │   └── metadata.json        # server 首次读取时缓存 prompt/model/cwd
+│   └── ...
+├── 2026-04-12/
+│   └── ...
+```
+
+### 事件格式
+
+每行一条 JSONL，envelope：
+
+```json
+{
+  "ts": "2026-04-11T13:18:07Z",
+  "event": "PreToolUse",
+  "data": { /* 原封不动的 Claude Code hook data */ }
+}
+```
+
+支持的 event 共 25 种，权威定义见 [`docs/claude-code-hooks.md`](docs/claude-code-hooks.md)
+（由 Anthropic 官方 hooks 文档整理）。
+
+## 仓库结构
+
+```
+auditit/
+├── README.md
+├── LICENSE
+├── install.py             # 独立安装器：install / uninstall / status / doctor
+├── hook.sh                # 全局 hook 脚本：写 audit.jsonl + SessionEnd 原子压缩
+├── server.py              # HTTP :8765, SSE tail, 零第三方依赖
+├── web/
+│   └── index.html         # 单文件 Web UI
+└── docs/
+    └── claude-code-hooks.md  # 官方 hooks 事件权威参考
+```
+
+## 设计决策说明
+
+### 为什么不用全局 `AUDITIT_TARGET` 环境变量门禁？
+
+之前的 workbench 架构用 `AUDITIT_TARGET=1` 做进程级开关，只审指定进程。该
+方案在多 claude 并发时会串日志（依赖全局 state file）。新架构改为"所有
+claude 会话都写，按 `session_id` 分目录隔离" —— 反正每个会话写自己的文件，
+没有竞争。
+
+### 为什么 `hook.sh` 用 `grep -o` 提取 session_id 而不是 python？
+
+hook 在每次工具调用前后各触发一次，对性能敏感。`grep -o` + `sed` 在 bash 内
+完成，比启动 python 解释器快一个量级。Claude Code hook 事件里 `session_id`
+是外层首字段，grep 取第一个 match 足够稳。
+
+### 为什么 SessionEnd gzip 用 tmpfile + rename？
+
+以前是直接 `gzip.open(gz, "wb")` 写完再删原 jsonl。若 gzip 中途异常但已写入
+部分数据，**原 jsonl 会被误删**。改为：写 `.gz.tmp` → 重新打开计算行数 →
+行数匹配才 `os.replace` + 删原文件。任何步骤异常都不会破坏现场。
+
+### 为什么 `install.py` 用 marker (`# auditit`) 而不是路径匹配？
+
+如果移动仓库（比如从 `~/auditit` 搬到 `~/src/auditit`），旧条目路径不再匹配，
+uninstall 就识别不出来。marker 是 bash 注释，对运行时无影响，但作为 settings.json
+字符串里的锚点永远跟着我们走。
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. 详见 [LICENSE](LICENSE).
