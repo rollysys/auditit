@@ -391,6 +391,26 @@ function openSession(date, sessionId) {
   loadEvents(date, sessionId);
 }
 
+function _fmtCtx(s) {
+  // Build the "Ctx: 38% (76k/1M)" cell with a color-coded inline style.
+  // Green < 70%, yellow 70-85%, red >= 85%. Returns null if the session
+  // has no ctx data (very old or not-yet-ended sessions).
+  const peak = s.ctx_peak_tokens;
+  const window = s.ctx_window;
+  const pct = s.ctx_peak_pct;
+  if (peak == null || window == null || pct == null || peak === 0) return null;
+  const kPeak = peak >= 1_000_000 ? (peak / 1_000_000).toFixed(2) + 'M'
+              : peak >= 1_000      ? (peak / 1_000).toFixed(0) + 'k'
+                                   : String(peak);
+  const kWindow = window >= 1_000_000 ? (window / 1_000_000).toFixed(0) + 'M'
+                                       : (window / 1_000).toFixed(0) + 'k';
+  const pctDisplay = (pct * 100).toFixed(0) + '%';
+  const color = pct >= 0.85 ? 'var(--red)'
+              : pct >= 0.70 ? 'var(--yellow)'
+                            : 'var(--green)';
+  return `<span style="color:${color};font-weight:600">${pctDisplay}</span> <span style="color:var(--gray)">(${kPeak}/${kWindow})</span>`;
+}
+
 async function loadMeta(date, sessionId) {
   const res = await fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/meta`);
   const data = await res.json();
@@ -403,6 +423,7 @@ async function loadMeta(date, sessionId) {
   const turns = s.num_turns || 0;
   const dur = s.duration_ms ? (s.duration_ms / 1000).toFixed(1) + 's' : '';
   const auditPath = `~/.claude-audit/${date}/${sessionId}/audit.jsonl`;
+  const ctxHtml = _fmtCtx(s);
 
   infoBar.innerHTML = `
     <div class="info-item"><label>ID: </label><span class="session-id">${esc(sessionId)}</span><button class="copy-id-btn" onclick="copySessionId(this, '${esc(sessionId)}')">复制</button></div>
@@ -411,6 +432,7 @@ async function loadMeta(date, sessionId) {
     <div class="info-item"><label>Turns: </label><span>${turns}</span></div>
     <div class="info-item"><label>Cost: </label><span>${cost}</span></div>
     <div class="info-item"><label>Duration: </label><span>${dur}</span></div>
+    ${ctxHtml ? `<div class="info-item"><label>Ctx: </label>${ctxHtml}</div>` : ''}
     <div class="info-item"><label>Status: </label><span>${esc(s.reason || 'active')}</span></div>
     <button class="resume-btn" onclick="copyResume(this, '${sessionId}', '${safeCwd}')">📋 Resume</button>
     <div class="prompt-bar" title="${esc(m.prompt || '')}">${esc(m.prompt || '—')}</div>

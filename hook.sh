@@ -56,6 +56,14 @@ raw_usage = {}
 num_turns = 0
 first_ts = None
 last_ts = None
+# Peak context pressure across the whole session: max over all assistant
+# messages of (input_tokens + cache_read + cache_creation). Captures how
+# close the session ever got to the model context limit, even after an
+# auto-compact reset the counter.
+# NOTE: no apostrophes allowed anywhere in this python -c block — outer
+# bash single quotes would terminate early and bash would try to parse
+# the python source, breaking the hook system-wide.
+ctx_peak_tokens = 0
 
 if transcript_path and os.path.exists(transcript_path):
     try:
@@ -85,6 +93,13 @@ if transcript_path and os.path.exists(transcript_path):
                     u = msg.get("usage")
                     if isinstance(u, dict):
                         raw_usage = u
+                        in_now = (
+                            (u.get("input_tokens", 0) or 0) +
+                            (u.get("cache_read_input_tokens", 0) or 0) +
+                            (u.get("cache_creation_input_tokens", 0) or 0)
+                        )
+                        if in_now > ctx_peak_tokens:
+                            ctx_peak_tokens = in_now
     except OSError:
         pass
 
@@ -108,11 +123,12 @@ usage = {
 }
 
 summary = {
-    "reason":      d.get("reason", ""),
-    "model":       model,
-    "num_turns":   num_turns,
-    "duration_ms": duration_ms,
-    "usage":       usage,
+    "reason":          d.get("reason", ""),
+    "model":           model,
+    "num_turns":       num_turns,
+    "duration_ms":     duration_ms,
+    "usage":           usage,
+    "ctx_peak_tokens": ctx_peak_tokens,
 }
 
 sd = os.environ.get("SESSION_DIR", "")

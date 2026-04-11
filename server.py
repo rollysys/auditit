@@ -109,6 +109,58 @@ def _match_pricing(model: str) -> dict | None:
     return PRICING[best_key] if best_key else None
 
 
+# ── Context window sizes ─────────────────────────────────────────────
+#
+# Source: https://platform.claude.com/docs/en/about-claude/models
+# Snapshot: 2026-04-11, mirrored in docs/claude-context-windows.md.
+# Opus 4.6 and Sonnet 4.6 ship a 1M context at standard pricing; every
+# other listed model is 200k. Unknown models fall back to 200k.
+
+DEFAULT_CTX_WINDOW = 200_000
+CTX_WINDOW: dict[str, int] = {
+    "claude-opus-4-6":   1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-opus-4-5":     200_000,
+    "claude-opus-4-1":     200_000,
+    "claude-opus-4":       200_000,
+    "claude-sonnet-4-5":   200_000,
+    "claude-sonnet-4":     200_000,
+    "claude-haiku-4-5":    200_000,
+    "claude-haiku-3-5":    200_000,
+    "claude-haiku-3":      200_000,
+}
+
+
+def _match_ctx_window(model: str) -> int:
+    if not model:
+        return DEFAULT_CTX_WINDOW
+    m = model.lower()
+    if m in CTX_WINDOW:
+        return CTX_WINDOW[m]
+    best_key: str | None = None
+    for key in CTX_WINDOW:
+        if key in m and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    return CTX_WINDOW[best_key] if best_key else DEFAULT_CTX_WINDOW
+
+
+def compute_ctx(model: str, ctx_peak_tokens: int) -> dict:
+    """Return a dict with ctx_peak_tokens / ctx_window / ctx_peak_pct.
+
+    All three are always present so the Web UI can conditionally render.
+    ctx_peak_pct is a float in [0, 1+]; values > 1.0 are clamped by the
+    UI display but kept raw here for diagnostics.
+    """
+    peak = int(ctx_peak_tokens or 0)
+    window = _match_ctx_window(model)
+    pct = (peak / window) if window else 0.0
+    return {
+        "ctx_peak_tokens": peak,
+        "ctx_window":      window,
+        "ctx_peak_pct":    round(pct, 4),
+    }
+
+
 def compute_cost(model: str, usage: dict) -> float:
     """Return the dollar cost of a session given its model and cleaned usage.
 
@@ -536,14 +588,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
             return
         meta = _load_meta(session_dir, session_id)
         summary = _load_summary(session_dir)
-        # Compute cost on the fly so pricing-table updates propagate to
-        # historical sessions without rewriting summary.json.
+        # Compute cost + context pressure on the fly so pricing/window
+        # updates propagate to historical sessions without rewriting
+        # summary.json.
         if summary:
             summary = dict(summary)
-            summary["total_cost_usd"] = compute_cost(
-                summary.get("model", "") or meta.get("model", ""),
-                summary.get("usage", {}),
-            )
+            model = summary.get("model", "") or meta.get("model", "")
+            summary["total_cost_usd"] = compute_cost(model, summary.get("usage", {}))
+            summary.update(compute_ctx(model, summary.get("ctx_peak_tokens", 0)))
         self._json({"metadata": meta, "summary": summary})
 
     def _delete_session(self, date: str, session_id: str):
