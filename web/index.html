@@ -30,14 +30,43 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 
 .date-group { border-bottom: 1px solid var(--border); }
 .date-group h2 { font-size: 11px; color: var(--green); padding: 4px 8px; background: var(--bg3); position: sticky; top: 0; }
-.session-item { display: flex; align-items: center; padding: 5px 8px; cursor: pointer; border-bottom: 1px solid transparent; gap: 6px; }
+.session-item { display: flex; align-items: flex-start; padding: 5px 8px; cursor: pointer; border-bottom: 1px solid transparent; gap: 6px; }
 .session-item:hover { background: var(--bg3); }
 .session-item.active { background: var(--bg3); border-left: 2px solid var(--blue); }
-.session-item .status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.session-item .status { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
 .session-item .status.active { background: var(--green); }
 .session-item .status.completed { background: var(--border); }
-.session-item .info { flex: 1; overflow: hidden; }
-.session-item .prompt { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item .info { flex: 1; overflow: hidden; min-width: 0; }
+/* Line 1: time + cwd basename + delete button */
+.session-item .headline { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.session-item .headline .time { color: var(--gray); font-family: 'Cascadia Code', 'Fira Code', monospace; flex-shrink: 0; }
+.session-item .headline .cwd { color: var(--cyan); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.session-item .headline .cwd.empty { color: var(--gray); font-style: italic; }
+.session-item .del-btn {
+  background: none; border: none; color: var(--border); cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+}
+.session-item .del-btn:hover { color: var(--red); }
+/* Sub-agent visual — indented tree branches and agent_type chip */
+.session-item.is-subagent { padding-left: 0; }
+.session-item .tree-bars {
+  color: #555; font-family: 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11px; white-space: pre; flex-shrink: 0; align-self: stretch;
+  padding: 4px 0 0 8px;
+}
+.session-item .agent-chip {
+  background: var(--bg3); color: var(--cyan); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 4px; font-size: 9px; font-family: inherit;
+  flex-shrink: 0;
+}
+.session-item .unclosed-chip {
+  color: var(--yellow); font-size: 11px; flex-shrink: 0; cursor: help;
+}
+.session-item .cost-none { color: #555; }
+/* Line 2: prompt (muted) */
+.session-item .prompt { font-size: 11px; color: var(--gray); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
+.session-item .prompt.empty { font-style: italic; color: var(--border); }
+/* Line 3: metadata */
 .session-item .meta { font-size: 10px; color: var(--gray); margin-top: 1px; }
 
 /* Right: detail */
@@ -65,10 +94,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .event-row { display: flex; align-items: flex-start; padding: 2px 4px; border-radius: 2px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; }
 .event-row:hover { background: var(--bg2); }
 .event-row .ts { color: var(--gray); width: 64px; flex-shrink: 0; font-size: 10px; line-height: 20px; }
+.event-row .depth-bars {
+  color: #666; flex-shrink: 0; line-height: 20px; font-size: 11px;
+  white-space: pre; letter-spacing: 0;
+}
 .event-row .icon { width: 16px; flex-shrink: 0; text-align: center; line-height: 20px; font-size: 10px; }
 .event-row .tool-name { width: 140px; flex-shrink: 0; color: var(--yellow); line-height: 20px; }
 .event-row .status-text { flex: 1; color: var(--fg); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .event-row .actions { flex-shrink: 0; margin-left: 4px; display: flex; gap: 3px; }
+/* Collapsible detail panels inherit the parent row's depth so they align */
+.detail-content.depth-1 { margin-left: calc(80px + 2ch); }
+.detail-content.depth-2 { margin-left: calc(80px + 4ch); }
+.detail-content.depth-3 { margin-left: calc(80px + 6ch); }
+.detail-content.depth-4 { margin-left: calc(80px + 8ch); }
+.detail-content.depth-5 { margin-left: calc(80px + 10ch); }
 
 /* Tool summary text: path uses per-tool color, preview stays dim */
 .tool-preview    { color: #777; }
@@ -177,6 +216,10 @@ let currentStream = null;
 let allSessions = {};
 let activeSessionId = null;
 let pendingToolCalls = {};
+// Stack of active sub-agents for the current session. Each element is
+// {agent_type, start_ts} pushed on SubagentStart and popped on SubagentStop.
+// Stack depth is the current nesting level for all in-between events.
+let subagentStack = [];
 
 // ========== Session List ==========
 async function loadSessions() {
@@ -185,29 +228,149 @@ async function loadSessions() {
   renderList();
 }
 
+function _basename(p) {
+  if (!p) return '';
+  const clean = p.replace(/\/+$/, '');
+  const idx = clean.lastIndexOf('/');
+  return idx >= 0 ? clean.substring(idx + 1) : clean;
+}
+
+function _hhmm(iso) {
+  if (!iso) return '--:--';
+  const d = new Date(iso);
+  if (isNaN(d)) return '--:--';
+  return d.toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit' });
+}
+
+function _shortModel(m) {
+  if (!m) return '';
+  // claude-haiku-4-5-20251001 → haiku-4-5
+  return m.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+}
+
+function _buildTree(sessions) {
+  // Group sub-agents under their immediate parent_session_id while keeping
+  // top-level (is_subagent=false) sessions as roots. Returns a flat list
+  // in render order: each root followed by its descendants (DFS) each
+  // tagged with the depth to use for indentation.
+  const byName = new Map();
+  for (const s of sessions) byName.set(s.id, s);
+  const children = new Map();   // parent_id -> [child, child, ...]
+  const roots = [];
+  for (const s of sessions) {
+    if (s.is_subagent && s.parent_session_id && byName.has(s.parent_session_id)) {
+      if (!children.has(s.parent_session_id)) children.set(s.parent_session_id, []);
+      children.get(s.parent_session_id).push(s);
+    } else {
+      roots.push(s);
+    }
+  }
+  // Sort sub-agents within each parent by start time (ascending).
+  for (const list of children.values()) {
+    list.sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''));
+  }
+  // DFS flatten. depth is relative to the date group: 0 for root sessions,
+  // 1 for their direct children, 2 for grandchildren, etc.
+  const flat = [];
+  const walk = (s, depth) => {
+    flat.push({ s, depth });
+    const kids = children.get(s.id) || [];
+    for (const k of kids) walk(k, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  return flat;
+}
+
 function renderList() {
   const el = document.getElementById('sessionList');
   let html = '';
   for (const [date, sessions] of Object.entries(allSessions)) {
     html += `<div class="date-group"><h2>${date}</h2>`;
-    for (const s of sessions) {
-      const cost = s.cost ? `$${s.cost.toFixed(3)}` : '';
+    for (const { s, depth } of _buildTree(sessions)) {
+      const costStr = (s.cost == null)
+        ? '<span class="cost-none">—</span>'
+        : (s.cost ? `$${s.cost.toFixed(3)}` : '');
       const turns = s.turns ? `${s.turns}t` : '';
       const dur = s.duration_ms ? `${(s.duration_ms/1000).toFixed(0)}s` : '';
-      const meta = [s.model, turns, cost, dur].filter(Boolean).join(' ');
+      const modelPart = s.is_subagent ? '' : _shortModel(s.model);
+      const metaParts = [modelPart, turns, dur].filter(Boolean);
+      // Meta (with cost as a raw-HTML piece) joined via span separators
+      const metaHtml = metaParts.map(esc).concat(costStr ? [costStr] : []).join(' · ');
       const statusClass = s.status === 'active' ? 'active' : 'completed';
       const isActive = s.id === activeSessionId ? ' active' : '';
-      html += `<div class="session-item${isActive}" onclick="openSession('${s.date}','${s.id}')">
+      const subClass = s.is_subagent ? ' is-subagent' : '';
+      const time = _hhmm(s.started_at);
+      const cwdBase = _basename(s.cwd) || '~';
+      const cwdClass = s.cwd ? 'cwd' : 'cwd empty';
+      const promptText = s.prompt || '';
+      const promptClass = promptText ? 'prompt' : 'prompt empty';
+      const promptDisplay = promptText || '<no prompt>';
+      // Tree-branch prefix for indented sub-agents.
+      const treeBars = depth > 0 ? '  '.repeat(depth - 1) + '└─' : '';
+      const chipHtml = (s.is_subagent && s.agent_type)
+        ? `<span class="agent-chip">${esc(s.agent_type)}</span>`
+        : '';
+      // ⚠ marker for sub-agents whose SubagentStop never arrived (Claude
+      // Code sometimes skips it). reason comes from summary.json.
+      const unclosedHtml = (s.is_subagent && s.reason && s.reason !== 'normal')
+        ? `<span class="unclosed-chip" title="Sub-agent closed without a matching SubagentStop (${esc(s.reason)})">⚠</span>`
+        : '';
+      html += `<div class="session-item${isActive}${subClass}" onclick="openSession('${s.date}','${s.id}')">
+        ${treeBars ? `<span class="tree-bars">${treeBars}</span>` : ''}
         <span class="status ${statusClass}"></span>
         <div class="info">
-          <div class="prompt" title="${esc(s.prompt)}">${esc(s.prompt) || '<i>no prompt</i>'}</div>
-          <div class="meta">${esc(meta)}</div>
+          <div class="headline">
+            <span class="time">${esc(time)}</span>
+            ${chipHtml}
+            ${unclosedHtml}
+            <span class="${cwdClass}" title="${esc(s.cwd || '')}">${esc(cwdBase)}</span>
+            <button class="del-btn" title="Delete session" onclick="deleteSession(event, '${s.date}','${s.id}')">✕</button>
+          </div>
+          <div class="${promptClass}" title="${esc(promptText)}">${esc(promptDisplay)}</div>
+          <div class="meta">${metaHtml}</div>
         </div>
       </div>`;
     }
     html += '</div>';
   }
   el.innerHTML = html || '<div class="loading">No sessions found</div>';
+}
+
+async function deleteSession(ev, date, sessionId) {
+  ev.stopPropagation();  // don't open the session
+  if (!confirm(`Delete session ${sessionId.substring(0,8)}? This cannot be undone.`)) return;
+
+  try {
+    const res = await fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    if (res.status === 204) {
+      // Remove from local state and re-render
+      for (const [d, ss] of Object.entries(allSessions)) {
+        const idx = ss.findIndex(s => s.id === sessionId && s.date === date);
+        if (idx >= 0) {
+          ss.splice(idx, 1);
+          if (!ss.length) delete allSessions[d];
+          break;
+        }
+      }
+      if (activeSessionId === sessionId) {
+        activeSessionId = null;
+        document.getElementById('detailWrap').classList.remove('active');
+        document.getElementById('emptyWrap').style.display = 'flex';
+      }
+      renderList();
+    } else if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      alert(`Cannot delete: ${body.error || 'session is still active'}.\n${body.hint || ''}`);
+    } else if (res.status === 404) {
+      alert('Session not found on disk. Refreshing list.');
+      loadSessions();
+    } else {
+      const body = await res.json().catch(() => ({}));
+      alert(`Delete failed (HTTP ${res.status}): ${body.error || 'unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Delete failed: ${e}`);
+  }
 }
 
 // ========== Detail View ==========
@@ -220,6 +383,7 @@ function openSession(date, sessionId) {
   document.getElementById('emptyWrap').style.display = 'none';
 
   pendingToolCalls = {};
+  subagentStack = [];
   const log = document.getElementById('eventLog');
   log.innerHTML = '<div class="loading">Loading...</div>';
 
@@ -289,6 +453,7 @@ function loadEvents(date, sessionId) {
     .then(events => {
       log.innerHTML = '';
       pendingToolCalls = {};
+      subagentStack = [];
       events.forEach(e => processEvent(e, log));
     })
     .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
@@ -554,16 +719,26 @@ function renderSessionEnd(ts, d, container) {
 }
 
 function renderSubagentStart(ts, d, container) {
+  // Rendered at the CURRENT depth (the parent's level) with a ┌ tree
+  // marker in the depth-bars column (NOT in .icon, which is fixed 16px
+  // and would clip/wrap ┌🤖 to a second line). Then push onto the stack
+  // so subsequent events indent one more level.
   const agentType = d.agent_type || d.tool_name || 'agent';
+  const agentId = (d.agent_id || '').substring(0, 8);
   const desc = d.description || d.prompt || '';
-  const text = `${esc(agentType)} ${esc(desc.substring(0, 150))}`;
-  container.append(makeRow(ts, '🤖', 'AGENT', text, 'subagent-start', text));
+  const label = agentId ? `${agentType} ${agentId}` : agentType;
+  const text = desc ? `${esc(label)} — ${esc(desc.substring(0, 140))}` : esc(label);
+  const row = makeRow(ts, '🤖', 'AGENT', text, 'subagent-start', text, '┌ ');
+  container.append(row);
+  subagentStack.push({ agent_type: agentType, agent_id: d.agent_id || '', start_ts: ts });
 }
 
 function renderSubagentStop(ts, d, container) {
+  // Pop BEFORE rendering so the └ line sits at the parent's depth, same as ┌.
   const agentType = d.agent_type || d.tool_name || 'agent';
+  if (subagentStack.length > 0) subagentStack.pop();
   const msg = (d.last_assistant_message || d.reason || '').substring(0, 150);
-  container.append(makeRow(ts, '🤖', 'AGENT DONE', `${esc(agentType)} — ${esc(msg)}`, 'subagent-stop', msg));
+  container.append(makeRow(ts, '🤖', 'AGENT DONE', `${esc(agentType)} — ${esc(msg)}`, 'subagent-stop', msg, '└ '));
 }
 
 function renderTaskCreated(ts, d, container) {
@@ -663,16 +838,33 @@ function renderElicitationResult(ts, d, container) {
   container.append(makeRow(ts, '💬✓', 'MCP OK', `${esc(server)}: ${esc(JSON.stringify(action).substring(0, 150))}`, 'mcp-event'));
 }
 
-function makeRow(ts, icon, toolName, statusText, cls, title) {
+function _depthBars(depth, trailer) {
+  // Render `depth` vertical bars + optional trailing tree marker as the
+  // indent prefix. Each bar/marker is 2 chars wide so alignment stays
+  // monospace. depth=0 with no trailer → empty string.
+  const base = depth > 0 ? '│ '.repeat(depth) : '';
+  if (trailer) return base + trailer;
+  return base;
+}
+
+function makeRow(ts, icon, toolName, statusText, cls, title, trailerChar) {
   const row = document.createElement('div');
   row.className = 'event-row ' + cls;
+  // Read depth from the live subagent stack so every renderer picks up
+  // indentation for free — no per-renderer changes needed. `trailerChar`
+  // is an optional extra bar-column glyph (e.g. ┌ / └) that keeps the
+  // wide bracket characters out of the fixed-width .icon cell.
+  const depth = subagentStack.length;
+  const bars = _depthBars(depth, trailerChar || '');
   row.innerHTML = `
     <span class="ts">${ts}</span>
+    <span class="depth-bars">${bars}</span>
     <span class="icon">${icon}</span>
     <span class="tool-name">${esc(toolName)}</span>
     <span class="status-text">${statusText}</span>
     <span class="actions"></span>
   `;
+  if (depth > 0) row.dataset.depth = depth;
   if (title) row.querySelector('.status-text').title = title;
   return row;
 }

@@ -17,6 +17,7 @@ in sync when pricing changes.
 import gzip
 import json
 import os
+import shutil
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -24,6 +25,11 @@ from pathlib import Path
 from urllib.parse import unquote
 
 AUDIT_DIR = Path.home() / ".claude-audit"
+
+# A session is considered "live" only if its audit.jsonl was touched within
+# this many seconds. Beyond that, any stuck directory (sub-agent leftover,
+# killed main session, whatever) is safe to delete.
+ACTIVE_WINDOW_S = 60
 
 
 # ── Pricing (per-million-token, USD, standard tier) ──────────────────
@@ -49,6 +55,44 @@ PRICING: dict[str, dict[str, float]] = {
     "claude-haiku-3-5":  {"in": 0.80,  "out": 4.00,  "cw5m": 1.00,  "cw1h": 1.60,  "cr": 0.08},
     "claude-haiku-3":    {"in": 0.25,  "out": 1.25,  "cw5m": 0.30,  "cw1h": 0.50,  "cr": 0.03},
 }
+
+
+def _is_session_active(session_dir: Path) -> bool:
+    """Return True only if a session directory is still being written to.
+
+    Not-active covers every case where we can safely delete:
+      - summary.json exists (normal SessionEnd completion)
+      - audit.jsonl.gz exists (atomic compress already done)
+      - audit.jsonl missing (empty dir, nothing to lose)
+      - audit.jsonl contains a SessionEnd event (hook fired but compress
+        step failed for some reason)
+      - audit.jsonl is stale — last mtime older than ACTIVE_WINDOW_S.
+        This is the catch-all for sub-agent leftovers (sub-agents have
+        their own session_id but never fire SessionStart/SessionEnd) and
+        for main sessions killed with -9 before they could reach SessionEnd.
+    """
+    if (session_dir / "summary.json").exists():
+        return False
+    if (session_dir / "audit.jsonl.gz").exists():
+        return False
+    jsonl = session_dir / "audit.jsonl"
+    if not jsonl.exists():
+        return False
+    try:
+        age = time.time() - jsonl.stat().st_mtime
+    except OSError:
+        return False
+    if age > ACTIVE_WINDOW_S:
+        return False
+    # Young file — look for a SessionEnd event we just failed to compress.
+    try:
+        with open(jsonl, "rb") as f:
+            data = f.read()
+        if b'"event":"SessionEnd"' in data:
+            return False
+    except OSError:
+        pass
+    return True
 
 
 def _match_pricing(model: str) -> dict | None:
@@ -101,8 +145,35 @@ def compute_cost(model: str, usage: dict) -> float:
     return round(cost, 6)
 
 
+SUBAGENT_SEP = "__agent__"
+
+
+def _load_subagent_meta(session_dir: Path) -> dict | None:
+    """Return the meta.json written by hook.sh for sub-agent dirs, or None."""
+    meta_path = session_dir / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            m = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(m, dict) or not m.get("is_subagent"):
+        return None
+    return m
+
+
 def list_sessions() -> dict:
-    """Return {date: [{id, prompt, model, cwd, count, cost, turns, duration_ms, status, started_at}]}"""
+    """Return {date: [session_entry, ...]}.
+
+    Each entry carries is_subagent / parent_session_id / depth fields so
+    the web UI can render sub-agents indented under their parent.
+
+    Top-level parent sessions do not contain `__agent__` in their dir
+    name; sub-agent directories are named
+    `<immediate_parent>__agent__<agent_id>` (recursive, so a
+    sub-sub-agent is `<p>__agent__<c>__agent__<gc>`).
+    """
     result = {}
     if not AUDIT_DIR.exists():
         return result
@@ -115,26 +186,73 @@ def list_sessions() -> dict:
             if not session_dir.is_dir():
                 continue
             sid = session_dir.name
-            meta = _load_meta(session_dir, sid)
             summary = _load_summary(session_dir)
             count = _count_events(session_dir)
+            status = "active" if _is_session_active(session_dir) else "completed"
 
-            status = "completed" if summary else "active"
-            model = summary.get("model", "") or meta.get("model", "")
-            cost = compute_cost(model, summary.get("usage", {}))
-            date_sessions.append({
-                "id": sid,
-                "date": date_dir.name,
-                "prompt": meta.get("prompt", ""),
-                "model": model,
-                "cwd": meta.get("cwd", ""),
-                "count": count,
-                "turns": summary.get("num_turns", 0),
-                "cost": cost,
-                "duration_ms": summary.get("duration_ms", 0),
-                "status": status,
-                "started_at": meta.get("started_at", ""),
-            })
+            sub_meta = _load_subagent_meta(session_dir)
+            is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
+
+            if is_subagent:
+                # Sub-agent entry. The "immediate parent" is the dir name
+                # preceding the last __agent__ token (so a grandchild's
+                # parent is the child dir, not the root session).
+                parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
+                agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
+                agent_type = (sub_meta or {}).get("agent_type", "")
+                description = (sub_meta or {}).get("description", "")
+                start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
+                depth      = sid.count(SUBAGENT_SEP)
+                # Try to inherit cwd from the root parent for display.
+                root_name = sid.split(SUBAGENT_SEP, 1)[0]
+                root_meta = _load_meta(date_dir / root_name, root_name) if (date_dir / root_name).is_dir() else {}
+                date_sessions.append({
+                    "id": sid,
+                    "date": date_dir.name,
+                    "prompt": description,
+                    "model": "",       # sub-agents share parent's model; leave blank
+                    "cwd": root_meta.get("cwd", ""),
+                    "count": count,
+                    "turns": summary.get("num_tool_calls", 0),
+                    # Sub-agent cost is not independently computable (usage
+                    # lives in the parent's transcript). Return None so the
+                    # UI shows "—" instead of $0.0000.
+                    "cost": None,
+                    "duration_ms": summary.get("duration_ms", 0),
+                    "status": status,
+                    "started_at": start_ts,
+                    "is_subagent": True,
+                    "parent_session_id": parent_name,
+                    "root_session_id": root_name,
+                    "agent_id": agent_id,
+                    "agent_type": agent_type,
+                    "depth": depth,
+                    # reason="unclosed" means hook.sh never saw a matching
+                    # SubagentStop for this layer — Claude Code sometimes
+                    # skips it. UI flags these with a ⚠ so they stand out.
+                    "reason": summary.get("reason", ""),
+                })
+            else:
+                meta = _load_meta(session_dir, sid)
+                model = summary.get("model", "") or meta.get("model", "")
+                cost = compute_cost(model, summary.get("usage", {}))
+                date_sessions.append({
+                    "id": sid,
+                    "date": date_dir.name,
+                    "prompt": meta.get("prompt", ""),
+                    "model": model,
+                    "cwd": meta.get("cwd", ""),
+                    "count": count,
+                    "turns": summary.get("num_turns", 0),
+                    "cost": cost,
+                    "duration_ms": summary.get("duration_ms", 0),
+                    "status": status,
+                    "started_at": meta.get("started_at", ""),
+                    "is_subagent": False,
+                    "parent_session_id": "",
+                    "root_session_id": sid,
+                    "depth": 0,
+                })
         if date_sessions:
             result[date_dir.name] = date_sessions
     return result
@@ -285,6 +403,17 @@ class AuditHandler(SimpleHTTPRequestHandler):
             # Serve static files (web/index.html)
             super().do_GET()
 
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/api/sessions/"):
+            parts = path.split("/")
+            # /api/sessions/<date>/<session-id> → 5 parts
+            if len(parts) == 5:
+                self._delete_session(parts[3], parts[4])
+                return
+        self.send_response(404)
+        self.end_headers()
+
     def _json(self, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -416,6 +545,66 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 summary.get("usage", {}),
             )
         self._json({"metadata": meta, "summary": summary})
+
+    def _delete_session(self, date: str, session_id: str):
+        """Delete a session directory. Refuses only if the session is
+        genuinely live (audit.jsonl was touched within the last
+        ACTIVE_WINDOW_S seconds and hasn't emitted SessionEnd yet).
+        Stuck directories from crashed sessions and sub-agent leftovers
+        are freely deletable. ?force=1 overrides even a live session.
+        """
+        session_dir = resolve_session(date, unquote(session_id))
+        if not session_dir:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        force = "force=1" in (self.path.split("?", 1)[1] if "?" in self.path else "")
+        if _is_session_active(session_dir) and not force:
+            body = json.dumps({
+                "error": "session is currently being written to",
+                "hint": f"wait {ACTIVE_WINDOW_S}s for it to go idle, or retry with ?force=1",
+            }).encode("utf-8")
+            self.send_response(409)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Cascade: also remove every sub-agent dir whose name starts with
+        # "<this_dir>__agent__". That covers direct children as well as
+        # grandchildren because __agent__ appears in every ancestor path.
+        # Note: this also cleans up if we're deleting a sub-agent itself —
+        # its own descendants (sub-sub-agents) share the same prefix.
+        date_dir = session_dir.parent
+        cascade_prefix = session_dir.name + SUBAGENT_SEP
+        cascaded: list[str] = []
+        try:
+            for sibling in date_dir.iterdir():
+                if sibling.is_dir() and sibling.name.startswith(cascade_prefix):
+                    try:
+                        shutil.rmtree(sibling)
+                        cascaded.append(sibling.name)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+        try:
+            shutil.rmtree(session_dir)
+        except OSError as e:
+            body = json.dumps({"error": str(e)}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # Success. 204 has no body by spec, so cascade info is just logged.
+        self.send_response(204)
+        self.end_headers()
 
     def _send_sse(self, event: str, data: str):
         msg = f"event: {event}\ndata: {data}\n\n"
