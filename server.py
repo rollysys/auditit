@@ -428,6 +428,197 @@ def resolve_session(date: str, session_id: str) -> Path | None:
     return None
 
 
+# ── Memory view helpers ──────────────────────────────────────────────
+#
+# The Memory view in the Web UI shows CLAUDE.md-family files for every
+# project Claude Code has ever touched, plus the global user file and
+# auto-memory markdown under ~/.claude/projects/<encoded>/memory/.
+#
+# Every file path returned to the client is validated against a strict
+# allow-list before being read, so the /api/memory/file endpoint cannot
+# be used to exfiltrate arbitrary files via crafted URLs.
+
+CLAUDE_HOME_DIR = Path.home() / ".claude"
+CLAUDE_PROJECTS_DIR = CLAUDE_HOME_DIR / "projects"
+GLOBAL_CLAUDE_MD = CLAUDE_HOME_DIR / "CLAUDE.md"
+
+
+def _resolve_project_cwd(project_dir: Path) -> str:
+    """Return the real cwd for a ~/.claude/projects/<encoded>/ directory.
+
+    Claude Code's encoding is `/` → `-`, which is lossy for paths that
+    contain `-`, so we don't decode the name; we instead read the `cwd`
+    field from the most recent transcript file in the dir. Falls back to
+    a naive decode if no transcript has a usable cwd.
+    """
+    jsonls = sorted(
+        (p for p in project_dir.glob("*.jsonl") if p.is_file()),
+        key=lambda p: -p.stat().st_mtime,
+    )
+    for jsonl in jsonls[:3]:
+        try:
+            with open(jsonl, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("cwd"):
+                        return obj["cwd"]
+        except OSError:
+            continue
+    # Fallback: naive decode. Correct for paths with no `-`, wrong
+    # otherwise; only used as a last resort label for display.
+    name = project_dir.name
+    if name.startswith("-"):
+        return name.replace("-", "/")
+    return name
+
+
+def _collect_memory_files(cwd: str, project_dir: Path) -> list[dict]:
+    """Collect the CLAUDE.md + .claude/CLAUDE.md + auto-memory/*.md files
+    for a given project, with size + mtime metadata. Missing files are
+    silently skipped.
+    """
+    files: list[dict] = []
+
+    def _stat_entry(p: Path, category: str) -> None:
+        try:
+            st = p.stat()
+        except OSError:
+            return
+        files.append({
+            "category": category,
+            "file_path": str(p),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        })
+
+    cwd_p = Path(cwd)
+    if (cwd_p / "CLAUDE.md").is_file():
+        _stat_entry(cwd_p / "CLAUDE.md", "CLAUDE.md")
+    # Skip <cwd>/.claude/CLAUDE.md when it actually IS the global file —
+    # happens when someone runs claude from their home directory so
+    # /Users/foo/.claude/CLAUDE.md is both "global" and the project's
+    # .claude/CLAUDE.md. The global entry already covers it.
+    local_claude = cwd_p / ".claude" / "CLAUDE.md"
+    try:
+        is_global_alias = local_claude.resolve() == GLOBAL_CLAUDE_MD.resolve()
+    except OSError:
+        is_global_alias = False
+    if local_claude.is_file() and not is_global_alias:
+        _stat_entry(local_claude, ".claude/CLAUDE.md")
+
+    memory_dir = project_dir / "memory"
+    if memory_dir.is_dir():
+        for md in sorted(memory_dir.glob("*.md")):
+            _stat_entry(md, "auto-memory")
+
+    return files
+
+
+def build_memory_index() -> dict:
+    """Return the full memory index for the /api/memory endpoint."""
+    result: dict = {"global": None, "projects": []}
+
+    if GLOBAL_CLAUDE_MD.is_file():
+        try:
+            st = GLOBAL_CLAUDE_MD.stat()
+            result["global"] = {
+                "category": "global",
+                "file_path": str(GLOBAL_CLAUDE_MD),
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            }
+        except OSError:
+            pass
+
+    if CLAUDE_PROJECTS_DIR.is_dir():
+        for p in CLAUDE_PROJECTS_DIR.iterdir():
+            if not p.is_dir():
+                continue
+            cwd = _resolve_project_cwd(p)
+            files = _collect_memory_files(cwd, p)
+            if not files:
+                continue
+            latest_mtime = max(f["mtime"] for f in files)
+            result["projects"].append({
+                "name": os.path.basename(cwd.rstrip("/")) or cwd,
+                "cwd": cwd,
+                "encoded": p.name,
+                "files": files,
+                "latest_mtime": latest_mtime,
+            })
+
+    # Secondary sort on `encoded` so ties (files with identical mtime,
+    # common after bulk copies or fresh installs) give a stable order.
+    result["projects"].sort(key=lambda x: (-x["latest_mtime"], x["encoded"]))
+    return result
+
+
+def is_memory_path_allowed(target: Path) -> bool:
+    """Allow-list check for /api/memory/file reads.
+
+    Accepts only:
+      1. ~/.claude/CLAUDE.md (exact)
+      2. ~/.claude/projects/<encoded>/memory/<name>.md (2 levels deep)
+      3. Any CLAUDE.md whose parent project has a corresponding entry
+         under ~/.claude/projects/, i.e. Claude Code has actually been
+         used in that project at least once.
+
+    Defense-in-depth: reject any raw path that is itself a symlink.
+    .resolve() below would follow it and the resulting canonical path
+    is already checked by the allow-list, so this is belt-and-braces —
+    it just makes the intent explicit and gives the attacker no way to
+    reason about follow-then-check gaps.
+    """
+    try:
+        if target.is_symlink():
+            return False
+        target = target.resolve()
+    except OSError:
+        return False
+    home = Path.home().resolve()
+
+    if target == (home / ".claude" / "CLAUDE.md"):
+        return True
+
+    projects_root = (home / ".claude" / "projects").resolve()
+    try:
+        rel = target.relative_to(projects_root)
+        parts = rel.parts
+        # rel must be <encoded>/memory/<name>.md
+        if (len(parts) == 3
+            and parts[1] == "memory"
+            and target.suffix == ".md"
+            and target.is_file()):
+            return True
+    except ValueError:
+        pass
+
+    if target.name == "CLAUDE.md" and target.is_file():
+        project_cwd = target.parent
+        if project_cwd.name == ".claude":
+            project_cwd = project_cwd.parent
+        # Project must be known to Claude Code: an encoded dir exists.
+        # Naive encoding is correct for paths without `-`; for the others
+        # we fall back to comparing against resolved cwds in the index.
+        encoded = str(project_cwd).replace("/", "-")
+        if (home / ".claude" / "projects" / encoded).is_dir():
+            return True
+        # Lossy-encoded fallback: scan the index for a matching cwd.
+        try:
+            for p in (home / ".claude" / "projects").iterdir():
+                if not p.is_dir():
+                    continue
+                if _resolve_project_cwd(p) == str(project_cwd):
+                    return True
+        except OSError:
+            pass
+
+    return False
+
+
 class AuditHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.web_dir = Path(__file__).parent / "web"
@@ -451,6 +642,10 @@ class AuditHandler(SimpleHTTPRequestHandler):
             parts = path.split("/")
             if len(parts) == 6:
                 self._serve_meta(parts[3], parts[4])
+        elif path == "/api/memory":
+            self._json(build_memory_index())
+        elif path == "/api/memory/file":
+            self._serve_memory_file()
         else:
             # Serve static files (web/index.html)
             super().do_GET()
@@ -597,6 +792,46 @@ class AuditHandler(SimpleHTTPRequestHandler):
             summary["total_cost_usd"] = compute_cost(model, summary.get("usage", {}))
             summary.update(compute_ctx(model, summary.get("ctx_peak_tokens", 0)))
         self._json({"metadata": meta, "summary": summary})
+
+    def _serve_memory_file(self):
+        """GET /api/memory/file?path=<url-encoded abs path>
+
+        Reads a single memory file and returns it as plain text. The
+        path must pass is_memory_path_allowed; anything else returns 404.
+        Size is capped at 2 MiB to keep the endpoint bounded — any real
+        CLAUDE.md or auto-memory file is tiny, so this caps a misuse.
+        """
+        from urllib.parse import parse_qs
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        qs = parse_qs(query)
+        raw = (qs.get("path") or [""])[0]
+        if not raw:
+            self.send_response(400)
+            self.end_headers()
+            return
+        target = Path(raw).expanduser()
+        if not is_memory_path_allowed(target):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            size = target.stat().st_size
+            if size > 2 * 1024 * 1024:
+                self.send_response(413)
+                self.end_headers()
+                return
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self.send_response(500)
+            self.end_headers()
+            return
+        body = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _delete_session(self, date: str, session_id: str):
         """Delete a session directory. Refuses only if the session is

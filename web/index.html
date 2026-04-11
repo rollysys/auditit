@@ -19,6 +19,53 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .header h1 { font-size: 12px; font-weight: 600; }
 .header button { background: var(--bg2); border: 1px solid var(--border); color: var(--fg); padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
 .header button:hover { background: var(--border); }
+/* View tabs */
+.view-tabs { display: flex; gap: 4px; margin-left: 16px; }
+.view-tabs button { padding: 2px 12px; }
+.view-tabs button.active { background: var(--bg); color: var(--blue); border-color: var(--blue); }
+
+/* Memory view (shares .layout) */
+.memory-project-list { width: 300px; min-width: 240px; max-width: 400px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; background: var(--bg2); }
+.memory-project-list::-webkit-scrollbar { width: 6px; }
+.memory-project-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.memory-project-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.memory-project-item:hover { background: var(--bg3); }
+.memory-project-item.active { background: var(--bg3); border-left: 2px solid var(--blue); }
+.memory-project-item .proj-name { font-size: 12px; color: var(--fg); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-project-item .proj-count { font-size: 10px; color: var(--gray); flex-shrink: 0; }
+.memory-project-item.global .proj-name { color: var(--cyan); font-weight: 600; }
+.memory-project-item .proj-cwd { font-size: 10px; color: var(--gray); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 1px; }
+
+.memory-file-panel { flex: 1; overflow-y: auto; padding: 8px 12px; }
+.memory-file-panel::-webkit-scrollbar { width: 6px; }
+.memory-file-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.memory-file-row { margin-bottom: 4px; }
+.memory-file-head {
+  display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 3px;
+  cursor: pointer; font-size: 11px;
+}
+.memory-file-head:hover { background: var(--border); }
+.memory-file-head .cat-chip {
+  background: var(--bg); color: var(--cyan); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 5px; font-size: 9px; flex-shrink: 0;
+}
+.memory-file-head .cat-chip.global { color: var(--yellow); }
+.memory-file-head .cat-chip.claude-md { color: var(--orange); }
+.memory-file-head .cat-chip.claude-local { color: var(--green); }
+.memory-file-head .cat-chip.auto-memory { color: var(--cyan); }
+.memory-file-head .fpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-family: 'Cascadia Code', 'Fira Code', monospace; }
+.memory-file-head .fsize { color: var(--gray); font-size: 10px; flex-shrink: 0; }
+.memory-file-head .caret { color: var(--gray); flex-shrink: 0; width: 10px; text-align: center; }
+.memory-file-body {
+  display: none; margin: 2px 0 8px; padding: 8px 12px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+  max-height: 60vh; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-word;
+  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px;
+  color: var(--fg); line-height: 1.5;
+}
+.memory-file-body.open { display: block; }
 
 /* Layout: left sidebar + right detail */
 .layout { display: flex; height: calc(100vh - 30px); }
@@ -187,13 +234,20 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 <body>
 
 <div class="header">
-  <h1>Claude Audit Viewer</h1>
+  <div style="display:flex;align-items:center;gap:8px">
+    <h1>Claude Audit Viewer</h1>
+    <div class="view-tabs">
+      <button id="tabSessions" class="active" onclick="switchView('sessions')">Sessions</button>
+      <button id="tabMemory" onclick="switchView('memory')">Memory</button>
+    </div>
+  </div>
   <div>
-    <button onclick="loadSessions()">↻ Refresh</button>
+    <button id="refreshBtn" onclick="refreshCurrentView()">↻ Refresh</button>
   </div>
 </div>
 
-<div class="layout">
+<!-- Sessions view -->
+<div class="layout" id="sessionsView">
   <!-- Left: Session list -->
   <div class="session-list" id="sessionList"></div>
 
@@ -208,6 +262,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
   <!-- Right: Empty state (no session selected) -->
   <div class="detail-panel-wrap" id="emptyWrap" style="display:flex">
     <div class="empty-detail">← Select a session</div>
+  </div>
+</div>
+
+<!-- Memory view -->
+<div class="layout" id="memoryView" style="display:none">
+  <div class="memory-project-list" id="memoryProjectList"></div>
+  <div class="memory-file-panel" id="memoryFilePanel">
+    <div class="empty-detail">← Select a project</div>
   </div>
 </div>
 
@@ -901,6 +963,176 @@ function formatLocalTime(isoTs) {
   // Convert "2026-04-11T08:23:48Z" → "16:23:48" (local timezone)
   const d = new Date(isoTs);
   return d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// ========== View switching ==========
+let currentView = 'sessions';
+let memoryData = null;
+let activeMemoryEncoded = null;
+
+function switchView(view) {
+  currentView = view;
+  document.getElementById('sessionsView').style.display = (view === 'sessions') ? 'flex' : 'none';
+  document.getElementById('memoryView').style.display  = (view === 'memory')   ? 'flex' : 'none';
+  document.getElementById('tabSessions').classList.toggle('active', view === 'sessions');
+  document.getElementById('tabMemory').classList.toggle('active', view === 'memory');
+  if (view === 'memory' && !memoryData) {
+    loadMemoryIndex();
+  }
+}
+
+function refreshCurrentView() {
+  if (currentView === 'sessions') {
+    loadSessions();
+  } else {
+    loadMemoryIndex();
+  }
+}
+
+// ========== Memory view ==========
+async function loadMemoryIndex() {
+  const panel = document.getElementById('memoryFilePanel');
+  panel.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const res = await fetch('/api/memory');
+    memoryData = await res.json();
+  } catch (e) {
+    document.getElementById('memoryProjectList').innerHTML =
+      '<div class="loading">Failed to load memory index</div>';
+    return;
+  }
+  renderMemoryProjects();
+  // Auto-open the most recent project (or global) on first load
+  if (memoryData.projects.length > 0 && !activeMemoryEncoded) {
+    openMemoryProject(memoryData.projects[0].encoded);
+  } else if (memoryData.global && !activeMemoryEncoded) {
+    openMemoryProject('__global__');
+  }
+}
+
+// Attribute-safe escaping for values placed inside HTML attributes via
+// innerHTML templates. Extends esc() by also escaping quote characters
+// (' and "). Critical for any data-* attribute holding user-controlled
+// strings like file paths or project dir names.
+function escAttr(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderMemoryProjects() {
+  const el = document.getElementById('memoryProjectList');
+  if (!memoryData) { el.innerHTML = ''; return; }
+  let html = '';
+  if (memoryData.global) {
+    const activeCls = activeMemoryEncoded === '__global__' ? ' active' : '';
+    html += `<div class="memory-project-item global${activeCls}" data-encoded="__global__">
+      <div style="flex:1;min-width:0">
+        <div class="proj-name">⌂ Global</div>
+        <span class="proj-cwd">${esc(memoryData.global.file_path)}</span>
+      </div>
+      <div class="proj-count">1</div>
+    </div>`;
+  }
+  for (const p of memoryData.projects) {
+    const activeCls = p.encoded === activeMemoryEncoded ? ' active' : '';
+    html += `<div class="memory-project-item${activeCls}" data-encoded="${escAttr(p.encoded)}">
+      <div style="flex:1;min-width:0">
+        <div class="proj-name" title="${escAttr(p.cwd)}">${esc(p.name)}</div>
+        <span class="proj-cwd">${esc(p.cwd)}</span>
+      </div>
+      <div class="proj-count">${p.files.length}</div>
+    </div>`;
+  }
+  el.innerHTML = html || '<div class="loading">No memory files found</div>';
+}
+
+// Event delegation: one listener on the container reads data-encoded.
+// Installed once on first use to avoid leaking per-render listeners.
+document.addEventListener('DOMContentLoaded', () => {
+  const list = document.getElementById('memoryProjectList');
+  if (list) {
+    list.addEventListener('click', (ev) => {
+      const item = ev.target.closest('.memory-project-item');
+      if (!item) return;
+      const encoded = item.dataset.encoded;
+      if (encoded) openMemoryProject(encoded);
+    });
+  }
+  const panel = document.getElementById('memoryFilePanel');
+  if (panel) {
+    panel.addEventListener('click', (ev) => {
+      const head = ev.target.closest('.memory-file-head');
+      if (!head) return;
+      const encodedPath = head.dataset.path;
+      if (encodedPath) toggleMemoryFile(head, encodedPath);
+    });
+  }
+});
+
+function openMemoryProject(encoded) {
+  activeMemoryEncoded = encoded;
+  renderMemoryProjects();
+  const panel = document.getElementById('memoryFilePanel');
+  let files = [];
+  if (encoded === '__global__') {
+    if (memoryData.global) files = [memoryData.global];
+  } else {
+    const proj = memoryData.projects.find(p => p.encoded === encoded);
+    if (proj) files = proj.files;
+  }
+  if (!files.length) {
+    panel.innerHTML = '<div class="empty-detail">(no files)</div>';
+    return;
+  }
+  let html = '';
+  for (const f of files) {
+    const catClass = f.category === 'global' ? 'global'
+                  : f.category === 'CLAUDE.md' ? 'claude-md'
+                  : f.category === '.claude/CLAUDE.md' ? 'claude-local'
+                  : f.category === 'auto-memory' ? 'auto-memory' : '';
+    const size = f.size < 1024 ? `${f.size}B` : `${(f.size/1024).toFixed(1)}K`;
+    const encodedPath = encodeURIComponent(f.file_path);
+    html += `<div class="memory-file-row">
+      <div class="memory-file-head" data-path="${escAttr(encodedPath)}">
+        <span class="caret">▶</span>
+        <span class="cat-chip ${catClass}">${esc(f.category)}</span>
+        <span class="fpath">${esc(f.file_path)}</span>
+        <span class="fsize">${size}</span>
+      </div>
+      <div class="memory-file-body"></div>
+    </div>`;
+  }
+  panel.innerHTML = html;
+}
+
+async function toggleMemoryFile(headEl, encodedPath) {
+  const body = headEl.nextElementSibling;
+  const caret = headEl.querySelector('.caret');
+  if (body.classList.contains('open')) {
+    body.classList.remove('open');
+    caret.textContent = '▶';
+    return;
+  }
+  if (!body.dataset.loaded) {
+    body.textContent = 'Loading...';
+    try {
+      const res = await fetch(`/api/memory/file?path=${encodedPath}`);
+      if (!res.ok) {
+        body.textContent = `Failed to load (HTTP ${res.status})`;
+      } else {
+        body.textContent = await res.text();
+        body.dataset.loaded = '1';
+      }
+    } catch (e) {
+      body.textContent = `Error: ${e}`;
+    }
+  }
+  body.classList.add('open');
+  caret.textContent = '▼';
 }
 
 // ========== Init ==========
