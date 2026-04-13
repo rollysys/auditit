@@ -70,7 +70,8 @@
   只留一个未压缩的 `audit.jsonl`。
 - **sub-agent 目录需要父会话 SessionEnd 时切片生成**: 如果父会话没有正常
   结束, sub-agent 的独立视图 (`<parent>__agent__<agent_id>/`) 不会生成。
-- **无鉴权**: `server.py` 绑 127.0.0.1, 没鉴权; 共享机器不要暴露到公网。
+- **无鉴权**: `server.py` 默认绑 `0.0.0.0:8765`, 没鉴权; 共享/公网机器请
+  用防火墙限制, 或改回 127.0.0.1。
 - **定价表需要人肉维护**: 新模型上线时手动更新 `docs/claude-pricing.md` 和
   `server.py::PRICING`。
 
