@@ -911,8 +911,8 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     port = 8765
-    server = ThreadedHTTPServer(("127.0.0.1", port), AuditHandler)
-    print(f"Audit viewer running at http://127.0.0.1:{port}")
+    server = ThreadedHTTPServer(("0.0.0.0", port), AuditHandler)
+    print(f"Audit viewer running at http://0.0.0.0:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
