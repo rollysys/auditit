@@ -12,7 +12,7 @@
   --cyan: #4ec9b0; --gray: #888;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: var(--bg); color: var(--fg); font-size: 12px; height: 100vh; overflow: hidden; }
+body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); font-size: 12px; height: 100vh; overflow: hidden; }
 
 /* Header */
 .header { background: var(--bg3); border-bottom: 1px solid var(--border); padding: 4px 12px; display: flex; align-items: center; justify-content: space-between; height: 30px; flex-shrink: 0; }
@@ -54,7 +54,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .memory-file-head .cat-chip.claude-md { color: var(--orange); }
 .memory-file-head .cat-chip.claude-local { color: var(--green); }
 .memory-file-head .cat-chip.auto-memory { color: var(--cyan); }
-.memory-file-head .fpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-family: 'Cascadia Code', 'Fira Code', monospace; }
+.memory-file-head .fpath { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-family: monospace; }
 .memory-file-head .fsize { color: var(--gray); font-size: 10px; flex-shrink: 0; }
 .memory-file-head .caret { color: var(--gray); flex-shrink: 0; width: 10px; text-align: center; }
 .memory-file-body {
@@ -62,7 +62,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
   background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
   max-height: 60vh; overflow-y: auto;
   white-space: pre-wrap; word-break: break-word;
-  font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px;
+  font-family: monospace; font-size: 11px;
   color: var(--fg); line-height: 1.5;
 }
 .memory-file-body.open { display: block; }
@@ -86,7 +86,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .session-item .info { flex: 1; overflow: hidden; min-width: 0; }
 /* Line 1: time + cwd basename + delete button */
 .session-item .headline { display: flex; align-items: center; gap: 6px; font-size: 11px; }
-.session-item .headline .time { color: var(--gray); font-family: 'Cascadia Code', 'Fira Code', monospace; flex-shrink: 0; }
+.session-item .headline .time { color: var(--gray); font-family: monospace; flex-shrink: 0; }
 .session-item .headline .cwd { color: var(--cyan); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .session-item .headline .cwd.empty { color: var(--gray); font-style: italic; }
 .session-item .del-btn {
@@ -97,7 +97,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 /* Sub-agent visual — indented tree branches and agent_type chip */
 .session-item.is-subagent { padding-left: 0; }
 .session-item .tree-bars {
-  color: #555; font-family: 'Cascadia Code', 'Fira Code', monospace;
+  color: #555; font-family: monospace;
   font-size: 11px; white-space: pre; flex-shrink: 0; align-self: stretch;
   padding: 4px 0 0 8px;
 }
@@ -138,16 +138,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .event-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 /* Event row */
-.event-row { display: flex; align-items: flex-start; padding: 2px 4px; border-radius: 2px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; }
+.event-row { display: flex; align-items: flex-start; padding: 0 4px; border-radius: 2px; font-family: monospace; font-size: 11px; }
 .event-row:hover { background: var(--bg2); }
-.event-row .ts { color: var(--gray); width: 64px; flex-shrink: 0; font-size: 10px; line-height: 20px; }
+.event-row .ts { color: var(--gray); width: 64px; flex-shrink: 0; font-size: 10px; line-height: 14px; }
 .event-row .depth-bars {
-  color: #666; flex-shrink: 0; line-height: 20px; font-size: 11px;
+  color: #666; flex-shrink: 0; line-height: 14px; font-size: 11px;
   white-space: pre; letter-spacing: 0;
 }
-.event-row .icon { width: 16px; flex-shrink: 0; text-align: center; line-height: 20px; font-size: 10px; }
-.event-row .tool-name { width: 140px; flex-shrink: 0; color: var(--yellow); line-height: 20px; }
-.event-row .status-text { flex: 1; color: var(--fg); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-row .icon { width: 16px; flex-shrink: 0; text-align: center; line-height: 14px; font-size: 10px; }
+.event-row .tool-name { width: 140px; flex-shrink: 0; color: var(--yellow); line-height: 14px; }
+.event-row .status-text { flex: 1; color: var(--fg); line-height: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .event-row .actions { flex-shrink: 0; margin-left: 4px; display: flex; gap: 3px; }
 /* Collapsible detail panels inherit the parent row's depth so they align */
 .detail-content.depth-1 { margin-left: calc(80px + 2ch); }
@@ -178,7 +178,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 
 /* Special events */
 .event-row.session-start { color: var(--cyan); }
-.event-row.user-prompt .status-text { color: var(--orange); }
+.event-row.user-prompt { background: rgba(214, 153, 92, 0.18); border-left: 3px solid var(--orange); margin: 3px 0; padding-top: 2px; padding-bottom: 2px; }
+.event-row.user-prompt .status-text { color: var(--orange); font-weight: 600; }
+.event-row.user-prompt .tool-name { color: var(--orange); font-weight: 600; }
 .event-row.stop-msg { color: var(--green); border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
 .event-row.session-end { color: var(--green); border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
 .event-row.subagent-start { color: var(--cyan); }
@@ -199,7 +201,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .expand-btn {
   background: none; border: 1px solid var(--border); color: var(--blue);
   padding: 0 4px; border-radius: 2px; cursor: pointer; font-size: 9px;
-  font-family: inherit; line-height: 16px; white-space: nowrap;
+  font-family: inherit; line-height: 14px; white-space: nowrap;
 }
 .expand-btn:hover { background: var(--border); color: var(--fg); }
 
@@ -222,7 +224,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; ba
 .prompt-bar { width: 100%; font-size: 11px; color: var(--orange); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-top: 2px; }
 
 /* Session ID display */
-.session-id { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 10px; user-select: all; }
+.session-id { font-family: monospace; font-size: 10px; user-select: all; }
 .copy-id-btn { background: var(--bg2); border: 1px solid var(--border); color: var(--gray); padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: 4px; }
 .copy-id-btn:hover { background: var(--border); color: var(--fg); }
 .copy-id-btn.copied { background: var(--green); color: #000; border-color: var(--green); }
