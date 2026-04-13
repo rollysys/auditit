@@ -451,8 +451,15 @@ function openSession(date, sessionId) {
   const log = document.getElementById('eventLog');
   log.innerHTML = '<div class="loading">Loading...</div>';
 
+  // Find session status to decide whether to open SSE stream
+  let isActive = false;
+  for (const ss of Object.values(allSessions)) {
+    const s = ss.find(x => x.id === sessionId && x.date === date);
+    if (s) { isActive = s.status === 'active'; break; }
+  }
+
   loadMeta(date, sessionId);
-  loadEvents(date, sessionId);
+  loadEvents(date, sessionId, isActive);
 }
 
 function _fmtCtx(s) {
@@ -546,7 +553,7 @@ function copyResume(btn, sessionId, cwd) {
 }
 
 // ========== Events (SSE) ==========
-function loadEvents(date, sessionId) {
+function loadEvents(date, sessionId, isActive) {
   if (currentStream) { currentStream.close(); currentStream = null; }
   const log = document.getElementById('eventLog');
 
@@ -560,12 +567,25 @@ function loadEvents(date, sessionId) {
     })
     .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
 
+  // Only open SSE stream for active (live) sessions.
+  // Completed sessions are fully available via the fetch above;
+  // opening SSE would replay all events a second time.
+  if (!isActive) return;
+
   const evtSource = new EventSource(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/stream`);
   currentStream = evtSource;
 
   evtSource.addEventListener('event', (e) => {
-    if (e.data === '__DONE__' || e.data === '__GZ__') {
+    if (e.data === '__DONE__') {
       evtSource.close(); currentStream = null;
+      return;
+    }
+    if (e.data === '__GZ__') {
+      // Session was compressed mid-stream: clear old live events
+      // and re-render from the complete gz replay that follows
+      log.innerHTML = '';
+      pendingToolCalls = {};
+      subagentStack = [];
       return;
     }
     try {
