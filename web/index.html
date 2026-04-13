@@ -501,30 +501,46 @@ async function loadMeta(date, sessionId) {
   `;
 }
 
-function copySessionId(btn, sessionId) {
-  navigator.clipboard.writeText(sessionId).then(() => {
-    btn.textContent = '✓';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = '复制'; btn.classList.remove('copied'); }, 2000);
+function writeClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try {
+      document.execCommand('copy') ? resolve() : reject(new Error('execCommand failed'));
+    } catch (e) { reject(e); }
+    finally { document.body.removeChild(ta); }
   });
+}
+
+function flashCopied(btn, okText, origText) {
+  btn.textContent = okText;
+  btn.classList.add('copied');
+  setTimeout(() => { btn.textContent = origText; btn.classList.remove('copied'); }, 2000);
+}
+
+function copySessionId(btn, sessionId) {
+  writeClipboard(sessionId).then(() => flashCopied(btn, '✓', '复制'))
+    .catch(() => flashCopied(btn, '✗ 失败', '复制'));
 }
 
 function copyAuditPath(btn, date, sessionId, auditPath) {
   const text = `请审计以下 session：\n审计日志：${auditPath}\nSession ID: ${sessionId}\n日期：${date}`;
-  navigator.clipboard.writeText(text).then(() => {
-    btn.textContent = '✓ 已复制';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = '📄 审计路径'; btn.classList.remove('copied'); }, 2000);
-  });
+  writeClipboard(text).then(() => flashCopied(btn, '✓ 已复制', '📄 审计路径'))
+    .catch(() => flashCopied(btn, '✗ 失败', '📄 审计路径'));
 }
 
 function copyResume(btn, sessionId, cwd) {
   const cmd = `cd "${cwd}" && claude --resume ${sessionId}`;
-  navigator.clipboard.writeText(cmd).then(() => {
-    btn.textContent = '✓ Copied';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = '📋 Resume'; btn.classList.remove('copied'); }, 2000);
-  });
+  writeClipboard(cmd).then(() => flashCopied(btn, '✓ Copied', '📋 Resume'))
+    .catch(() => flashCopied(btn, '✗ Failed', '📋 Resume'));
 }
 
 // ========== Events (SSE) ==========
