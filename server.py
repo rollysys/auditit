@@ -18,6 +18,7 @@ import gzip
 import json
 import os
 import shutil
+import subprocess
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -25,6 +26,26 @@ from pathlib import Path
 from urllib.parse import unquote
 
 AUDIT_DIR = Path.home() / ".claude-audit"
+SKILLS_DIR = Path.home() / ".claude" / "skills"
+REPO_DIR = Path(__file__).resolve().parent
+
+
+def _read_repo_version():
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(REPO_DIR), "rev-parse", "--short=7", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        date = subprocess.check_output(
+            ["git", "-C", str(REPO_DIR), "log", "-1", "--format=%cI", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        return {"commit": commit, "date": date}
+    except Exception:
+        return {"commit": "", "date": ""}
+
+
+REPO_VERSION = _read_repo_version()
 
 # A session is considered "live" only if its audit.jsonl was touched within
 # this many seconds. Beyond that, any stuck directory (sub-agent leftover,
@@ -619,6 +640,88 @@ def is_memory_path_allowed(target: Path) -> bool:
     return False
 
 
+def list_skills():
+    """Enumerate user-level skills at ~/.claude/skills/<name>/.
+
+    Returns a list of {name, path, description, files: [rel_path, ...]}.
+    Description is parsed best-effort from SKILL.md YAML frontmatter.
+    """
+    out = []
+    if not SKILLS_DIR.is_dir():
+        return out
+    for d in sorted(SKILLS_DIR.iterdir()):
+        # Follow top-level symlinks — user skill dirs are commonly symlinks
+        # into a dotfiles repo or another project. Read-only serve only.
+        if not d.is_dir():
+            continue
+        description = ""
+        skill_md = d / "SKILL.md"
+        if skill_md.is_file():
+            try:
+                text = skill_md.read_text(encoding="utf-8", errors="replace")
+                if text.startswith("---"):
+                    end = text.find("\n---", 3)
+                    if end > 0:
+                        for line in text[3:end].splitlines():
+                            line = line.strip()
+                            if line.lower().startswith("description:"):
+                                description = line.split(":", 1)[1].strip().strip('"').strip("'")
+                                break
+            except OSError:
+                pass
+        files = []
+        for f in sorted(d.rglob("*")):
+            if f.is_symlink() or not f.is_file():
+                continue
+            try:
+                rel = f.relative_to(d)
+            except ValueError:
+                continue
+            files.append({"path": str(rel), "size": f.stat().st_size})
+        out.append({
+            "name": d.name,
+            "path": str(d),
+            "description": description,
+            "files": files,
+        })
+    return out
+
+
+def resolve_skill_file(name: str, rel_path: str) -> Path | None:
+    """Safely resolve ~/.claude/skills/<name>/<rel_path> — reject any
+    path that escapes the skill directory or follows a symlink.
+    """
+    if not name or "/" in name or name.startswith(".") or "\x00" in name:
+        return None
+    if "\x00" in rel_path or rel_path.startswith("/"):
+        return None
+    # Anchor must be a direct child of ~/.claude/skills — block names that
+    # try to escape via ".." etc. (already partially blocked by the "/" check).
+    anchor = SKILLS_DIR / name
+    if anchor.parent.resolve() != SKILLS_DIR.resolve():
+        return None
+    # Follow the top-level symlink (dotfiles-style skills).
+    try:
+        base = anchor.resolve()
+    except OSError:
+        return None
+    if not base.is_dir():
+        return None
+    target = base / rel_path
+    try:
+        if target.is_symlink():
+            return None
+        target_resolved = target.resolve()
+    except OSError:
+        return None
+    # Resolved target must stay within the resolved skill directory.
+    if not str(target_resolved).startswith(str(base) + os.sep):
+        return None
+    if not target_resolved.is_file():
+        return None
+    return target_resolved
+
+
 class AuditHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         self.web_dir = Path(__file__).parent / "web"
@@ -646,6 +749,12 @@ class AuditHandler(SimpleHTTPRequestHandler):
             self._json(build_memory_index())
         elif path == "/api/memory/file":
             self._serve_memory_file()
+        elif path == "/api/version":
+            self._json(REPO_VERSION)
+        elif path == "/api/skills":
+            self._json(list_skills())
+        elif path == "/api/skills/file":
+            self._serve_skill_file()
         else:
             # Serve static files (web/index.html)
             super().do_GET()
@@ -811,6 +920,37 @@ class AuditHandler(SimpleHTTPRequestHandler):
             return
         target = Path(raw).expanduser()
         if not is_memory_path_allowed(target):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            size = target.stat().st_size
+            if size > 2 * 1024 * 1024:
+                self.send_response(413)
+                self.end_headers()
+                return
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            self.send_response(500)
+            self.end_headers()
+            return
+        body = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_skill_file(self):
+        """GET /api/skills/file?name=<skill>&path=<rel path>"""
+        from urllib.parse import parse_qs
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        qs = parse_qs(query)
+        name = (qs.get("name") or [""])[0]
+        rel = (qs.get("path") or [""])[0]
+        target = resolve_skill_file(name, rel)
+        if target is None:
             self.send_response(404)
             self.end_headers()
             return

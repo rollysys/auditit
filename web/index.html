@@ -238,9 +238,11 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 <div class="header">
   <div style="display:flex;align-items:center;gap:8px">
     <h1>Claude Audit Viewer</h1>
+    <span id="versionBadge" style="color:var(--gray);font-size:10px;font-family:monospace"></span>
     <div class="view-tabs">
       <button id="tabSessions" class="active" onclick="switchView('sessions')">Sessions</button>
       <button id="tabMemory" onclick="switchView('memory')">Memory</button>
+      <button id="tabSkills" onclick="switchView('skills')">Skills</button>
     </div>
   </div>
   <div>
@@ -272,6 +274,14 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
   <div class="memory-project-list" id="memoryProjectList"></div>
   <div class="memory-file-panel" id="memoryFilePanel">
     <div class="empty-detail">← Select a project</div>
+  </div>
+</div>
+
+<!-- Skills view (reuses memory-* styles for visual consistency) -->
+<div class="layout" id="skillsView" style="display:none">
+  <div class="memory-project-list" id="skillsList"></div>
+  <div class="memory-file-panel" id="skillsFilePanel">
+    <div class="empty-detail">← Select a skill</div>
   </div>
 </div>
 
@@ -1007,24 +1017,38 @@ function formatLocalTime(isoTs) {
 let currentView = 'sessions';
 let memoryData = null;
 let activeMemoryEncoded = null;
+let skillsData = null;
+let activeSkillName = null;
 
 function switchView(view) {
   currentView = view;
   document.getElementById('sessionsView').style.display = (view === 'sessions') ? 'flex' : 'none';
   document.getElementById('memoryView').style.display  = (view === 'memory')   ? 'flex' : 'none';
+  document.getElementById('skillsView').style.display  = (view === 'skills')   ? 'flex' : 'none';
   document.getElementById('tabSessions').classList.toggle('active', view === 'sessions');
   document.getElementById('tabMemory').classList.toggle('active', view === 'memory');
-  if (view === 'memory' && !memoryData) {
-    loadMemoryIndex();
-  }
+  document.getElementById('tabSkills').classList.toggle('active', view === 'skills');
+  if (view === 'memory' && !memoryData) loadMemoryIndex();
+  if (view === 'skills' && !skillsData) loadSkillsIndex();
 }
 
 function refreshCurrentView() {
-  if (currentView === 'sessions') {
-    loadSessions();
-  } else {
-    loadMemoryIndex();
-  }
+  if (currentView === 'sessions') loadSessions();
+  else if (currentView === 'memory') loadMemoryIndex();
+  else if (currentView === 'skills') loadSkillsIndex();
+}
+
+async function loadVersionBadge() {
+  try {
+    const res = await fetch('/api/version');
+    const v = await res.json();
+    if (v.commit) {
+      const d = v.date ? v.date.substring(0, 10) : '';
+      const el = document.getElementById('versionBadge');
+      el.textContent = d ? `${v.commit} · ${d}` : v.commit;
+      el.title = v.date || '';
+    }
+  } catch (e) {}
 }
 
 // ========== Memory view ==========
@@ -1173,8 +1197,130 @@ async function toggleMemoryFile(headEl, encodedPath) {
   caret.textContent = '▼';
 }
 
+// ========== Skills view ==========
+async function loadSkillsIndex() {
+  const panel = document.getElementById('skillsFilePanel');
+  panel.innerHTML = '<div class="loading">Loading...</div>';
+  try {
+    const res = await fetch('/api/skills');
+    skillsData = await res.json();
+  } catch (e) {
+    document.getElementById('skillsList').innerHTML = '<div class="loading">Failed to load</div>';
+    return;
+  }
+  renderSkillsList();
+  if (skillsData.length > 0) {
+    openSkill(activeSkillName && skillsData.find(s => s.name === activeSkillName)
+      ? activeSkillName : skillsData[0].name);
+  } else {
+    panel.innerHTML = '<div class="empty-detail">(no skills found in ~/.claude/skills)</div>';
+  }
+}
+
+function renderSkillsList() {
+  const el = document.getElementById('skillsList');
+  if (!skillsData) { el.innerHTML = ''; return; }
+  let html = '';
+  for (const s of skillsData) {
+    const activeCls = s.name === activeSkillName ? ' active' : '';
+    html += `<div class="memory-project-item${activeCls}" data-skill="${escAttr(s.name)}">
+      <div style="flex:1;min-width:0">
+        <div class="proj-name">${esc(s.name)}</div>
+        <span class="proj-cwd" title="${escAttr(s.description)}">${esc(s.description || '')}</span>
+      </div>
+      <div class="proj-count">${s.files.length}</div>
+    </div>`;
+  }
+  el.innerHTML = html || '<div class="loading">No skills</div>';
+}
+
+function openSkill(name) {
+  activeSkillName = name;
+  renderSkillsList();
+  const panel = document.getElementById('skillsFilePanel');
+  const skill = skillsData.find(s => s.name === name);
+  if (!skill) { panel.innerHTML = ''; return; }
+  const files = skill.files.slice().sort((a, b) => {
+    // SKILL.md first, then alphabetical
+    if (a.path === 'SKILL.md') return -1;
+    if (b.path === 'SKILL.md') return 1;
+    return a.path.localeCompare(b.path);
+  });
+  const MAX_LIST = 500;
+  const truncated = files.length > MAX_LIST;
+  const shown = truncated ? files.slice(0, MAX_LIST) : files;
+  let html = '';
+  if (truncated) {
+    html += `<div class="loading" style="text-align:left;padding:8px">Showing first ${MAX_LIST} of ${files.length} files.</div>`;
+  }
+  for (const f of shown) {
+    const size = f.size < 1024 ? `${f.size}B` : `${(f.size/1024).toFixed(1)}K`;
+    const chipCls = f.path === 'SKILL.md' ? 'claude-md' : 'auto-memory';
+    html += `<div class="memory-file-row">
+      <div class="memory-file-head" data-skill="${escAttr(name)}" data-path="${escAttr(f.path)}">
+        <span class="caret">▶</span>
+        <span class="cat-chip ${chipCls}">${f.path === 'SKILL.md' ? 'SKILL' : 'file'}</span>
+        <span class="fpath">${esc(f.path)}</span>
+        <span class="fsize">${size}</span>
+      </div>
+      <div class="memory-file-body"></div>
+    </div>`;
+  }
+  panel.innerHTML = html;
+}
+
+async function toggleSkillFile(headEl, skill, relPath) {
+  const body = headEl.nextElementSibling;
+  const caret = headEl.querySelector('.caret');
+  if (body.classList.contains('open')) {
+    body.classList.remove('open');
+    caret.textContent = '▶';
+    return;
+  }
+  if (!body.dataset.loaded) {
+    body.textContent = 'Loading...';
+    try {
+      const url = `/api/skills/file?name=${encodeURIComponent(skill)}&path=${encodeURIComponent(relPath)}`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        body.textContent = `Failed to load (HTTP ${res.status})`;
+      } else {
+        body.textContent = await res.text();
+        body.dataset.loaded = '1';
+      }
+    } catch (e) {
+      body.textContent = `Error: ${e}`;
+    }
+  }
+  body.classList.add('open');
+  caret.textContent = '▼';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const list = document.getElementById('skillsList');
+  if (list) {
+    list.addEventListener('click', (ev) => {
+      const item = ev.target.closest('.memory-project-item');
+      if (!item) return;
+      const name = item.dataset.skill;
+      if (name) openSkill(name);
+    });
+  }
+  const panel = document.getElementById('skillsFilePanel');
+  if (panel) {
+    panel.addEventListener('click', (ev) => {
+      const head = ev.target.closest('.memory-file-head');
+      if (!head) return;
+      const skill = head.dataset.skill;
+      const relPath = head.dataset.path;
+      if (skill && relPath) toggleSkillFile(head, skill, relPath);
+    });
+  }
+});
+
 // ========== Init ==========
 loadSessions();
+loadVersionBadge();
 </script>
 </body>
 </html>
