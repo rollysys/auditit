@@ -383,6 +383,206 @@ def _extract_meta_from_events(session_dir: Path, sid: str) -> dict:
     return meta
 
 
+def detect_provider(model: str) -> str:
+    """Infer the API provider from the model name string.
+
+    Pure heuristic — we do not capture ANTHROPIC_BASE_URL or
+    CLAUDE_CODE_USE_BEDROCK in summary.json today, so the model string is
+    all we have. Good enough when provider correlates with model family.
+    """
+    if not model:
+        return "unknown"
+    m = model.lower().strip()
+    if m == "<synthetic>":
+        return "synthetic"
+    # Bedrock: "anthropic.claude-..." or "us.anthropic.claude-..."
+    if m.startswith("anthropic.") or ".anthropic." in m:
+        return "bedrock"
+    # Vertex AI: "claude-opus-4-1@20250805" style
+    if "@" in m and "claude-" in m:
+        return "vertex"
+    if m.startswith("claude-"):
+        return "anthropic"
+    # Common third-party OpenAI-compatible endpoints (via ANTHROPIC_BASE_URL override)
+    if m.startswith("qwen"):     return "qwen"
+    if m.startswith("glm"):      return "zhipu"
+    if m.startswith("kimi") or m.startswith("moonshot"): return "moonshot"
+    if m.startswith("deepseek"): return "deepseek"
+    if m.startswith("gpt-") or m.startswith("o1") or m.startswith("o3") or m.startswith("o4"):
+        return "openai"
+    if m.startswith("gemini"):   return "gemini"
+    if m.startswith("grok"):     return "xai"
+    return "other"
+
+
+def build_stats() -> dict:
+    """Aggregate across all main sessions for the Dashboard view.
+
+    Sub-agent directories are skipped — their token/cost usage is already
+    captured in the parent session's transcript, so counting them would
+    double-count.
+
+    Returns:
+      totals: totals across all sessions (session count, cost, tokens,
+              duration). Tokens are split into input / output / cache_read /
+              cache_creation (5m+1h combined).
+      by_model: per-model aggregates (same fields as totals minus duration).
+      by_date: per-day aggregates (sorted ascending), for trend chart.
+      top_by_cost: top 20 sessions by cost.
+      top_by_ctx: top 20 sessions by ctx_peak_pct.
+    """
+    totals = {
+        "sessions": 0, "cost": 0.0,
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "duration_ms": 0, "turns": 0,
+    }
+    by_model: dict[str, dict] = {}
+    by_provider: dict[str, dict] = {}
+    by_date: dict[str, dict] = {}
+    all_sessions: list[dict] = []
+
+    if not AUDIT_DIR.exists():
+        return {"totals": totals, "by_model": [], "by_provider": [], "by_date": [],
+                "top_by_cost": [], "top_by_ctx": []}
+
+    for date_dir in sorted(AUDIT_DIR.iterdir()):
+        if not date_dir.is_dir() or not date_dir.name.startswith("20"):
+            continue
+        for session_dir in sorted(date_dir.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            sid = session_dir.name
+            # Skip sub-agent directories — their usage is already in the parent.
+            if SUBAGENT_SEP in sid:
+                continue
+            summary = _load_summary(session_dir)
+            if not summary:
+                continue
+
+            usage = summary.get("usage", {}) or {}
+            inp = int(usage.get("input_tokens", 0) or 0)
+            out = int(usage.get("output_tokens", 0) or 0)
+            cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
+            cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
+            if not cw:
+                cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
+                      + int(usage.get("cache_creation_1h_tokens", 0) or 0))
+
+            meta = _load_meta(session_dir, sid)
+            model = summary.get("model", "") or meta.get("model", "") or "unknown"
+            provider = detect_provider(model)
+            cost = compute_cost(model, usage)
+            dur  = int(summary.get("duration_ms", 0) or 0)
+            turns = int(summary.get("num_turns", 0) or 0)
+            # calls/hr normalised from turns over duration. Clamp tiny durations
+            # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
+            calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
+            ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
+
+            totals["sessions"] += 1
+            totals["cost"] += cost
+            totals["input_tokens"] += inp
+            totals["output_tokens"] += out
+            totals["cache_read_tokens"] += cr
+            totals["cache_creation_tokens"] += cw
+            totals["duration_ms"] += dur
+            totals["turns"] += turns
+
+            bm = by_model.setdefault(model, {
+                "model": model, "provider": provider, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "turns": 0, "duration_ms": 0,
+            })
+            bm["sessions"] += 1
+            bm["cost"] += cost
+            bm["input_tokens"] += inp
+            bm["output_tokens"] += out
+            bm["cache_read_tokens"] += cr
+            bm["cache_creation_tokens"] += cw
+            bm["turns"] += turns
+            bm["duration_ms"] += dur
+
+            bp = by_provider.setdefault(provider, {
+                "provider": provider, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "turns": 0, "duration_ms": 0,
+            })
+            bp["sessions"] += 1
+            bp["cost"] += cost
+            bp["input_tokens"] += inp
+            bp["output_tokens"] += out
+            bp["cache_read_tokens"] += cr
+            bp["cache_creation_tokens"] += cw
+            bp["turns"] += turns
+            bp["duration_ms"] += dur
+
+            bd = by_date.setdefault(date_dir.name, {
+                "date": date_dir.name, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "turns": 0, "duration_ms": 0,
+            })
+            bd["sessions"] += 1
+            bd["cost"] += cost
+            bd["input_tokens"] += inp
+            bd["output_tokens"] += out
+            bd["cache_read_tokens"] += cr
+            bd["cache_creation_tokens"] += cw
+            bd["turns"] += turns
+            bd["duration_ms"] += dur
+
+            all_sessions.append({
+                "id": sid,
+                "date": date_dir.name,
+                "model": model,
+                "provider": provider,
+                "cost": round(cost, 4),
+                "turns": turns,
+                "duration_ms": dur,
+                "calls_per_hr": round(calls_per_hr, 1),
+                "prompt": meta.get("prompt", "")[:200],
+                "cwd": meta.get("cwd", ""),
+                "ctx_peak_pct": ctx["ctx_peak_pct"],
+                "ctx_peak_tokens": ctx["ctx_peak_tokens"],
+                "ctx_window": ctx["ctx_window"],
+            })
+
+    # Round totals for cleaner JSON; compute calls/hr from aggregated duration
+    def _cph(turns: int, dur_ms: int) -> float:
+        return round(turns * 3_600_000.0 / dur_ms, 1) if dur_ms >= 1000 else 0.0
+
+    totals["cost"] = round(totals["cost"], 4)
+    totals["calls_per_hr"] = _cph(totals["turns"], totals["duration_ms"])
+    for m in by_model.values():
+        m["cost"] = round(m["cost"], 4)
+        m["calls_per_hr"] = _cph(m["turns"], m["duration_ms"])
+    for p in by_provider.values():
+        p["cost"] = round(p["cost"], 4)
+        p["calls_per_hr"] = _cph(p["turns"], p["duration_ms"])
+    for d in by_date.values():
+        d["cost"] = round(d["cost"], 4)
+        d["calls_per_hr"] = _cph(d["turns"], d["duration_ms"])
+
+    by_model_list    = sorted(by_model.values(),    key=lambda x: -x["cost"])
+    by_provider_list = sorted(by_provider.values(), key=lambda x: -x["cost"])
+    by_date_list     = sorted(by_date.values(),     key=lambda x: x["date"])
+
+    top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])[:20]
+    top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])[:20]
+
+    return {
+        "totals": totals,
+        "by_model": by_model_list,
+        "by_provider": by_provider_list,
+        "by_date": by_date_list,
+        "top_by_cost": top_by_cost,
+        "top_by_ctx": top_by_ctx,
+    }
+
+
 def _load_summary(session_dir: Path) -> dict:
     summary_path = session_dir / "summary.json"
     if summary_path.exists():
@@ -751,6 +951,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
             self._serve_memory_file()
         elif path == "/api/version":
             self._json(REPO_VERSION)
+        elif path == "/api/stats":
+            self._json(build_stats())
         elif path == "/api/skills":
             self._json(list_skills())
         elif path == "/api/skills/file":
