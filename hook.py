@@ -192,13 +192,15 @@ def _slice_subagents(parent_dir: Path) -> None:
         return
 
     parent_dir_name = parent_dir.name
-    date_dir_path = parent_dir.parent
+    # In the flat layout this is AUDIT_DIR — sub-agent dirs become
+    # ~/.claude-audit/<sid>__agent__<id>/, co-located with the parent.
+    siblings_root = parent_dir.parent
     slicing_stack: list[dict] = []
     last_task_desc = ""
 
     def _open_layer(agent_id, agent_type, desc, start_ts, immediate_parent_name):
         name = immediate_parent_name + "__agent__" + (agent_id or "unknown")
-        dpath = date_dir_path / name
+        dpath = siblings_root / name
         dpath.mkdir(parents=True, exist_ok=True)
         fh = open(dpath / "audit.jsonl", "ab")
         return {
@@ -364,8 +366,13 @@ def _main():
     if not session_id:
         return
 
-    date_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    session_dir = AUDIT_DIR / date_dir / session_id
+    # Flat layout: ~/.claude-audit/<sid>/ — date is intentionally NOT in the
+    # path. Older releases used ~/.claude-audit/YYYY-MM-DD/<sid>/, which made
+    # long-running sessions fragment into multiple directories (one per UTC
+    # day they were active). The frontend can still group/sort by start or
+    # last-activity timestamps when needed; those live in the events themselves
+    # and the audit.jsonl mtime.
+    session_dir = AUDIT_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
     _write_env_file(session_dir)

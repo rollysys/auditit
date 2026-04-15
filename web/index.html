@@ -451,7 +451,21 @@ let subagentStack = [];
 // ========== Session List ==========
 async function loadSessions() {
   const res = await fetch('/api/sessions');
-  allSessions = await res.json();
+  const body = await res.json();
+  // Server returns flat {sessions: [...]} (no date partitioning). Group
+  // client-side by last_active_at date for the UI's "today / yesterday"
+  // sticky headers. Fall back to started_at, then to "unknown".
+  const list = body.sessions || [];
+  const grouped = {};
+  for (const s of list) {
+    const bucket = (s.last_active_at || s.started_at || '').substring(0, 10) || 'unknown';
+    if (!grouped[bucket]) grouped[bucket] = [];
+    grouped[bucket].push(s);
+  }
+  // Sort dates descending so newest group is first
+  const ordered = {};
+  for (const k of Object.keys(grouped).sort().reverse()) ordered[k] = grouped[k];
+  allSessions = ordered;
   renderList();
 }
 
@@ -542,7 +556,7 @@ function renderList() {
       const unclosedHtml = (s.is_subagent && s.reason && s.reason !== 'normal')
         ? `<span class="unclosed-chip" title="Sub-agent closed without a matching SubagentStop (${esc(s.reason)})">⚠</span>`
         : '';
-      html += `<div class="session-item${isActive}${subClass}" onclick="openSession('${s.date}','${s.id}')">
+      html += `<div class="session-item${isActive}${subClass}" onclick="openSession('${s.id}')">
         ${treeBars ? `<span class="tree-bars">${treeBars}</span>` : ''}
         <span class="status ${statusClass}"></span>
         <div class="info">
@@ -551,7 +565,7 @@ function renderList() {
             ${chipHtml}
             ${unclosedHtml}
             <span class="${cwdClass}" title="${esc(s.cwd || '')}">${esc(cwdBase)}</span>
-            <button class="del-btn" title="Delete session" onclick="deleteSession(event, '${s.date}','${s.id}')">✕</button>
+            <button class="del-btn" title="Delete session" onclick="deleteSession(event, '${s.id}')">✕</button>
           </div>
           <div class="${promptClass}" title="${esc(promptText)}">${esc(promptDisplay)}</div>
           <div class="meta">${metaHtml}</div>
@@ -563,16 +577,16 @@ function renderList() {
   el.innerHTML = html || '<div class="loading">No sessions found</div>';
 }
 
-async function deleteSession(ev, date, sessionId) {
+async function deleteSession(ev, sessionId) {
   ev.stopPropagation();  // don't open the session
   if (!confirm(`Delete session ${sessionId.substring(0,8)}? This cannot be undone.`)) return;
 
   try {
-    const res = await fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
     if (res.status === 204) {
       // Remove from local state and re-render
       for (const [d, ss] of Object.entries(allSessions)) {
-        const idx = ss.findIndex(s => s.id === sessionId && s.date === date);
+        const idx = ss.findIndex(s => s.id === sessionId);
         if (idx >= 0) {
           ss.splice(idx, 1);
           if (!ss.length) delete allSessions[d];
@@ -601,7 +615,7 @@ async function deleteSession(ev, date, sessionId) {
 }
 
 // ========== Detail View ==========
-function openSession(date, sessionId) {
+function openSession(sessionId) {
   activeSessionId = sessionId;
   renderList();
 
@@ -617,12 +631,12 @@ function openSession(date, sessionId) {
   // Find session status to decide whether to open SSE stream
   let isActive = false;
   for (const ss of Object.values(allSessions)) {
-    const s = ss.find(x => x.id === sessionId && x.date === date);
+    const s = ss.find(x => x.id === sessionId);
     if (s) { isActive = s.status === 'active'; break; }
   }
 
-  loadMeta(date, sessionId);
-  loadEvents(date, sessionId, isActive);
+  loadMeta(sessionId);
+  loadEvents(sessionId, isActive);
 }
 
 function _fmtCtx(s) {
@@ -645,8 +659,8 @@ function _fmtCtx(s) {
   return `<span style="color:${color};font-weight:600">${pctDisplay}</span> <span style="color:var(--gray)">(${kPeak}/${kWindow})</span>`;
 }
 
-async function loadMeta(date, sessionId) {
-  const res = await fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/meta`);
+async function loadMeta(sessionId) {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/meta`);
   const data = await res.json();
   const infoBar = document.getElementById('infoBar');
 
@@ -656,12 +670,12 @@ async function loadMeta(date, sessionId) {
   const cost = s.total_cost_usd != null ? `$${s.total_cost_usd.toFixed(4)}` : '';
   const turns = s.num_turns || 0;
   const dur = s.duration_ms ? (s.duration_ms / 1000).toFixed(1) + 's' : '';
-  const auditPath = `~/.claude-audit/${date}/${sessionId}/audit.jsonl`;
+  const auditPath = `~/.claude-audit/${sessionId}/audit.jsonl`;
   const ctxHtml = _fmtCtx(s);
 
   infoBar.innerHTML = `
     <div class="info-item"><label>ID: </label><span class="session-id">${esc(sessionId)}</span><button class="copy-id-btn" onclick="copySessionId(this, '${esc(sessionId)}')">复制</button></div>
-    <button class="copy-audit-btn" onclick="copyAuditPath(this, '${date}', '${esc(sessionId)}', '${auditPath}')">📄 审计路径</button>
+    <button class="copy-audit-btn" onclick="copyAuditPath(this, '${esc(sessionId)}', '${auditPath}')">📄 审计路径</button>
     <div class="info-item"><label>Model: </label><span>${esc(m.model || s.model || '—')}</span></div>
     <div class="info-item"><label>Turns: </label><span>${turns}</span></div>
     <div class="info-item"><label>Cost: </label><span>${cost}</span></div>
@@ -703,8 +717,8 @@ function copySessionId(btn, sessionId) {
     .catch(() => flashCopied(btn, '✗ 失败', '复制'));
 }
 
-function copyAuditPath(btn, date, sessionId, auditPath) {
-  const text = `请审计以下 session：\n审计日志：${auditPath}\nSession ID: ${sessionId}\n日期：${date}`;
+function copyAuditPath(btn, sessionId, auditPath) {
+  const text = `请审计以下 session：\n审计日志：${auditPath}\nSession ID: ${sessionId}`;
   writeClipboard(text).then(() => flashCopied(btn, '✓ 已复制', '📄 审计路径'))
     .catch(() => flashCopied(btn, '✗ 失败', '📄 审计路径'));
 }
@@ -716,11 +730,11 @@ function copyResume(btn, sessionId, cwd) {
 }
 
 // ========== Events (SSE) ==========
-function loadEvents(date, sessionId, isActive) {
+function loadEvents(sessionId, isActive) {
   if (currentStream) { currentStream.close(); currentStream = null; }
   const log = document.getElementById('eventLog');
 
-  fetch(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/events`)
+  fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
     .then(r => r.json())
     .then(events => {
       log.innerHTML = '';
@@ -735,7 +749,7 @@ function loadEvents(date, sessionId, isActive) {
   // opening SSE would replay all events a second time.
   if (!isActive) return;
 
-  const evtSource = new EventSource(`/api/sessions/${date}/${encodeURIComponent(sessionId)}/stream`);
+  const evtSource = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/stream`);
   currentStream = evtSource;
 
   evtSource.addEventListener('event', (e) => {
@@ -1374,11 +1388,11 @@ function renderDashboard(s) {
   // Click-through to Sessions tab
   panel.querySelectorAll('tr[data-sid]').forEach(tr => {
     tr.addEventListener('click', () => {
-      const sid = tr.dataset.sid, date = tr.dataset.date;
+      const sid = tr.dataset.sid;
       switchView('sessions');
       // loadSessions may already have data; wait a tick then open
       setTimeout(() => {
-        if (typeof openSession === 'function') openSession(date, sid);
+        if (typeof openSession === 'function') openSession(sid);
       }, 50);
     });
   });

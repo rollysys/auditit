@@ -51,9 +51,13 @@ def assert_ok(name, cond, msg=""):
         raise AssertionError(f"{name}: {msg}")
 
 
-def today_dir(home: Path, sid: str) -> Path:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return home / ".claude-audit" / today / sid
+def session_dir(home: Path, sid: str) -> Path:
+    """Resolve the per-session directory under flat layout."""
+    return home / ".claude-audit" / sid
+
+
+# Backwards-compat alias for tests that still reference the old name.
+today_dir = session_dir
 
 
 def test_basic_append_and_env():
@@ -412,6 +416,32 @@ def test_nested_subagent_slicing():
         assert_eq("l2.num_tool_calls", l2_summary["num_tool_calls"], 1)
 
 
+def test_flat_layout_no_date_dir():
+    """Hook writes directly under ~/.claude-audit/<sid>/ — there must be
+    no YYYY-MM-DD intermediate dir. Regression guard for the flat-layout
+    refactor (long-running sessions used to fragment by UTC day).
+    """
+    print("test_flat_layout_no_date_dir")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        sid = "test-sid-flat"
+        rc = run_hook("PreToolUse",
+                      {"session_id": sid, "tool_name": "Read"},
+                      {}, home)
+        assert_eq("rc", rc, 0)
+        # Direct child of .claude-audit must be the session dir, not a date.
+        children = sorted(p.name for p in (home / ".claude-audit").iterdir())
+        assert_ok("only session dir present, no date dir",
+                  children == [sid],
+                  f"unexpected entries: {children}")
+        # No nested date dir inside the session dir either.
+        sd = home / ".claude-audit" / sid
+        for child in sd.iterdir():
+            assert_ok(f"child {child.name} is a file (not a date dir)",
+                      child.is_file(),
+                      f"unexpected directory inside session dir: {child}")
+
+
 def main():
     failed = 0
     for fn in [
@@ -421,6 +451,7 @@ def main():
         test_subagent_slicing,
         test_single_session_multi_tool_capture,
         test_nested_subagent_slicing,
+        test_flat_layout_no_date_dir,
     ]:
         try:
             fn()

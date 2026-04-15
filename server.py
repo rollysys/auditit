@@ -4,10 +4,14 @@ server.py — Web backend for the auditit session viewer.
 
 Serves:
   GET /              → Web UI (index.html)
-  GET /api/sessions  → List all sessions (grouped by date)
-  GET /api/sessions/<date>/<session-id>/events → All events (JSONL or gz)
-  GET /api/sessions/<date>/<session-id>/stream → SSE stream (live tail)
-  GET /api/sessions/<date>/<session-id>/meta   → metadata + summary
+  GET /api/sessions  → List all sessions
+  GET /api/sessions/<session-id>/events → All events (JSONL or gz)
+  GET /api/sessions/<session-id>/stream → SSE stream (live tail)
+  GET /api/sessions/<session-id>/meta   → metadata + summary
+
+Layout: ~/.claude-audit/<session-id>/audit.jsonl(.gz) — flat, no date
+partitioning. Sub-agent dirs live as siblings: <session-id>__agent__<id>/.
+The frontend groups/sorts by started_at and last_active_at as needed.
 
 Cost is computed at serve time from summary.json's raw `usage` dict and
 `model` name, against the PRICING table below. Keep docs/claude-pricing.md
@@ -236,99 +240,131 @@ def _load_subagent_meta(session_dir: Path) -> dict | None:
     return m
 
 
-def list_sessions() -> dict:
-    """Return {date: [session_entry, ...]}.
+def _last_active_iso(session_dir: Path) -> str:
+    """ISO-8601 UTC of the most recent file mtime in the session dir.
 
-    Each entry carries is_subagent / parent_session_id / depth fields so
-    the web UI can render sub-agents indented under their parent.
-
-    Top-level parent sessions do not contain `__agent__` in their dir
-    name; sub-agent directories are named
-    `<immediate_parent>__agent__<agent_id>` (recursive, so a
-    sub-sub-agent is `<p>__agent__<c>__agent__<gc>`).
+    Used as a stable proxy for "session last touched" without re-parsing
+    the audit.jsonl tail. Falls back to "" if the dir has no files.
     """
-    result = {}
-    if not AUDIT_DIR.exists():
-        return result
-
-    for date_dir in sorted(AUDIT_DIR.iterdir(), reverse=True):
-        if not date_dir.is_dir() or not date_dir.name.startswith("20"):
-            continue
-        date_sessions = []
-        for session_dir in sorted(date_dir.iterdir()):
-            if not session_dir.is_dir():
+    latest = 0.0
+    try:
+        for p in session_dir.iterdir():
+            try:
+                m = p.stat().st_mtime
+                if m > latest:
+                    latest = m
+            except OSError:
                 continue
-            sid = session_dir.name
-            summary = _load_summary(session_dir)
-            count = _count_events(session_dir)
-            status = "active" if _is_session_active(session_dir) else "completed"
+    except OSError:
+        return ""
+    if not latest:
+        return ""
+    from datetime import datetime as _dt, timezone as _tz
+    return _dt.fromtimestamp(latest, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-            sub_meta = _load_subagent_meta(session_dir)
-            is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
 
-            if is_subagent:
-                # Sub-agent entry. The "immediate parent" is the dir name
-                # preceding the last __agent__ token (so a grandchild's
-                # parent is the child dir, not the root session).
-                parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
-                agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
-                agent_type = (sub_meta or {}).get("agent_type", "")
-                description = (sub_meta or {}).get("description", "")
-                start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
-                depth      = sid.count(SUBAGENT_SEP)
-                # Try to inherit cwd from the root parent for display.
-                root_name = sid.split(SUBAGENT_SEP, 1)[0]
-                root_meta = _load_meta(date_dir / root_name, root_name) if (date_dir / root_name).is_dir() else {}
-                date_sessions.append({
-                    "id": sid,
-                    "date": date_dir.name,
-                    "prompt": description,
-                    "model": "",       # sub-agents share parent's model; leave blank
-                    "cwd": root_meta.get("cwd", ""),
-                    "count": count,
-                    "turns": summary.get("num_tool_calls", 0),
-                    # Sub-agent cost is not independently computable (usage
-                    # lives in the parent's transcript). Return None so the
-                    # UI shows "—" instead of $0.0000.
-                    "cost": None,
-                    "duration_ms": summary.get("duration_ms", 0),
-                    "status": status,
-                    "started_at": start_ts,
-                    "is_subagent": True,
-                    "parent_session_id": parent_name,
-                    "root_session_id": root_name,
-                    "agent_id": agent_id,
-                    "agent_type": agent_type,
-                    "depth": depth,
-                    # reason="unclosed" means hook.sh never saw a matching
-                    # SubagentStop for this layer — Claude Code sometimes
-                    # skips it. UI flags these with a ⚠ so they stand out.
-                    "reason": summary.get("reason", ""),
-                })
-            else:
-                meta = _load_meta(session_dir, sid)
-                model = summary.get("model", "") or meta.get("model", "")
-                cost = compute_cost(model, summary.get("usage", {}))
-                date_sessions.append({
-                    "id": sid,
-                    "date": date_dir.name,
-                    "prompt": meta.get("prompt", ""),
-                    "model": model,
-                    "cwd": meta.get("cwd", ""),
-                    "count": count,
-                    "turns": summary.get("num_turns", 0),
-                    "cost": cost,
-                    "duration_ms": summary.get("duration_ms", 0),
-                    "status": status,
-                    "started_at": meta.get("started_at", ""),
-                    "is_subagent": False,
-                    "parent_session_id": "",
-                    "root_session_id": sid,
-                    "depth": 0,
-                })
-        if date_sessions:
-            result[date_dir.name] = date_sessions
-    return result
+def list_sessions() -> dict:
+    """Return {sessions: [...], by_root: {...}} for the Web UI.
+
+    Each session entry carries is_subagent / parent_session_id / depth
+    so the UI can nest sub-agents under their parent.
+
+    Layout (post-flatten): ~/.claude-audit/<sid>/ for parents,
+    ~/.claude-audit/<sid>__agent__<id>/ for sub-agents (siblings, not
+    nested). Sorting/grouping by date is the frontend's job — we just
+    expose started_at and last_active_at.
+    """
+    sessions: list[dict] = []
+    if not AUDIT_DIR.exists():
+        return {"sessions": sessions}
+
+    # First pass: collect non-subagent (parent) dirs so we can resolve
+    # cwd inheritance for sub-agents.
+    parent_meta_cache: dict[str, dict] = {}
+
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        # Old date-partitioned dirs still on disk during transition look
+        # like "20YY-MM-DD". Skip them — the migration script handles them.
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        if SUBAGENT_SEP in sid:
+            continue  # collected in the second pass below
+        meta = _load_meta(session_dir, sid)
+        parent_meta_cache[sid] = meta
+
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        summary = _load_summary(session_dir)
+        count   = _count_events(session_dir)
+        status  = "active" if _is_session_active(session_dir) else "completed"
+        last_active = _last_active_iso(session_dir)
+
+        sub_meta = _load_subagent_meta(session_dir)
+        is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
+
+        if is_subagent:
+            parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
+            agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
+            agent_type = (sub_meta or {}).get("agent_type", "")
+            description = (sub_meta or {}).get("description", "")
+            start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
+            depth      = sid.count(SUBAGENT_SEP)
+            root_name = sid.split(SUBAGENT_SEP, 1)[0]
+            root_meta = parent_meta_cache.get(root_name, {})
+            sessions.append({
+                "id": sid,
+                "prompt": description,
+                "model": "",
+                "cwd": root_meta.get("cwd", ""),
+                "count": count,
+                "turns": summary.get("num_tool_calls", 0),
+                "cost": None,
+                "duration_ms": summary.get("duration_ms", 0),
+                "status": status,
+                "started_at": start_ts,
+                "last_active_at": last_active,
+                "is_subagent": True,
+                "parent_session_id": parent_name,
+                "root_session_id": root_name,
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "depth": depth,
+                "reason": summary.get("reason", ""),
+            })
+        else:
+            meta = parent_meta_cache.get(sid, {})
+            model = summary.get("model", "") or meta.get("model", "")
+            cost = compute_cost(model, summary.get("usage", {}))
+            sessions.append({
+                "id": sid,
+                "prompt": meta.get("prompt", ""),
+                "model": model,
+                "cwd": meta.get("cwd", ""),
+                "count": count,
+                "turns": summary.get("num_turns", 0),
+                "cost": cost,
+                "duration_ms": summary.get("duration_ms", 0),
+                "status": status,
+                "started_at": meta.get("started_at", ""),
+                "last_active_at": last_active,
+                "is_subagent": False,
+                "parent_session_id": "",
+                "root_session_id": sid,
+                "depth": 0,
+            })
+
+    return {"sessions": sessions}
 
 
 def _load_meta(session_dir: Path, sid: str) -> dict:
@@ -516,110 +552,119 @@ def build_stats() -> dict:
         return {"totals": totals, "by_model": [], "by_provider": [], "by_date": [],
                 "top_by_cost": [], "top_by_ctx": []}
 
-    for date_dir in sorted(AUDIT_DIR.iterdir()):
-        if not date_dir.is_dir() or not date_dir.name.startswith("20"):
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
             continue
-        for session_dir in sorted(date_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            sid = session_dir.name
-            # Skip sub-agent directories — their usage is already in the parent.
-            if SUBAGENT_SEP in sid:
-                continue
-            summary = _load_summary(session_dir)
-            if not summary:
-                continue
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        # Old date-partitioned dirs left over during transition — skip.
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        # Sub-agent directories — their usage lives in the parent's transcript.
+        if SUBAGENT_SEP in sid:
+            continue
+        summary = _load_summary(session_dir)
+        if not summary:
+            continue
 
-            usage = summary.get("usage", {}) or {}
-            inp = int(usage.get("input_tokens", 0) or 0)
-            out = int(usage.get("output_tokens", 0) or 0)
-            cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
-            cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
-            if not cw:
-                cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
-                      + int(usage.get("cache_creation_1h_tokens", 0) or 0))
+        usage = summary.get("usage", {}) or {}
+        inp = int(usage.get("input_tokens", 0) or 0)
+        out = int(usage.get("output_tokens", 0) or 0)
+        cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        if not cw:
+            cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
+                  + int(usage.get("cache_creation_1h_tokens", 0) or 0))
 
-            meta = _load_meta(session_dir, sid)
-            env  = _load_env(session_dir)
-            model = summary.get("model", "") or meta.get("model", "") or "unknown"
-            provider = detect_provider(model, env)
-            cost = compute_cost(model, usage)
-            dur  = int(summary.get("duration_ms", 0) or 0)
-            turns = int(summary.get("num_turns", 0) or 0)
-            # calls/hr normalised from turns over duration. Clamp tiny durations
-            # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
-            calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
-            ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
+        meta = _load_meta(session_dir, sid)
+        env  = _load_env(session_dir)
+        model = summary.get("model", "") or meta.get("model", "") or "unknown"
+        provider = detect_provider(model, env)
+        cost = compute_cost(model, usage)
+        dur  = int(summary.get("duration_ms", 0) or 0)
+        turns = int(summary.get("num_turns", 0) or 0)
+        # calls/hr normalised from turns over duration. Clamp tiny durations
+        # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
+        calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
+        ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
 
-            totals["sessions"] += 1
-            totals["cost"] += cost
-            totals["input_tokens"] += inp
-            totals["output_tokens"] += out
-            totals["cache_read_tokens"] += cr
-            totals["cache_creation_tokens"] += cw
-            totals["duration_ms"] += dur
-            totals["turns"] += turns
+        # Bucket the session into a date. With the flat layout this comes
+        # from started_at (or last_active_at as a fallback) — there is no
+        # date in the path. Keep the YYYY-MM-DD slice for the trend chart.
+        date_bucket = (meta.get("started_at", "") or _last_active_iso(session_dir))[:10]
+        if not date_bucket:
+            date_bucket = "unknown"
 
-            bm = by_model.setdefault(model, {
-                "model": model, "provider": provider, "sessions": 0, "cost": 0.0,
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "turns": 0, "duration_ms": 0,
-            })
-            bm["sessions"] += 1
-            bm["cost"] += cost
-            bm["input_tokens"] += inp
-            bm["output_tokens"] += out
-            bm["cache_read_tokens"] += cr
-            bm["cache_creation_tokens"] += cw
-            bm["turns"] += turns
-            bm["duration_ms"] += dur
+        totals["sessions"] += 1
+        totals["cost"] += cost
+        totals["input_tokens"] += inp
+        totals["output_tokens"] += out
+        totals["cache_read_tokens"] += cr
+        totals["cache_creation_tokens"] += cw
+        totals["duration_ms"] += dur
+        totals["turns"] += turns
 
-            bp = by_provider.setdefault(provider, {
-                "provider": provider, "sessions": 0, "cost": 0.0,
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "turns": 0, "duration_ms": 0,
-            })
-            bp["sessions"] += 1
-            bp["cost"] += cost
-            bp["input_tokens"] += inp
-            bp["output_tokens"] += out
-            bp["cache_read_tokens"] += cr
-            bp["cache_creation_tokens"] += cw
-            bp["turns"] += turns
-            bp["duration_ms"] += dur
+        bm = by_model.setdefault(model, {
+            "model": model, "provider": provider, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bm["sessions"] += 1
+        bm["cost"] += cost
+        bm["input_tokens"] += inp
+        bm["output_tokens"] += out
+        bm["cache_read_tokens"] += cr
+        bm["cache_creation_tokens"] += cw
+        bm["turns"] += turns
+        bm["duration_ms"] += dur
 
-            bd = by_date.setdefault(date_dir.name, {
-                "date": date_dir.name, "sessions": 0, "cost": 0.0,
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "turns": 0, "duration_ms": 0,
-            })
-            bd["sessions"] += 1
-            bd["cost"] += cost
-            bd["input_tokens"] += inp
-            bd["output_tokens"] += out
-            bd["cache_read_tokens"] += cr
-            bd["cache_creation_tokens"] += cw
-            bd["turns"] += turns
-            bd["duration_ms"] += dur
+        bp = by_provider.setdefault(provider, {
+            "provider": provider, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bp["sessions"] += 1
+        bp["cost"] += cost
+        bp["input_tokens"] += inp
+        bp["output_tokens"] += out
+        bp["cache_read_tokens"] += cr
+        bp["cache_creation_tokens"] += cw
+        bp["turns"] += turns
+        bp["duration_ms"] += dur
 
-            all_sessions.append({
-                "id": sid,
-                "date": date_dir.name,
-                "model": model,
-                "provider": provider,
-                "cost": round(cost, 4),
-                "turns": turns,
-                "duration_ms": dur,
-                "calls_per_hr": round(calls_per_hr, 1),
-                "prompt": meta.get("prompt", "")[:200],
-                "cwd": meta.get("cwd", ""),
-                "ctx_peak_pct": ctx["ctx_peak_pct"],
-                "ctx_peak_tokens": ctx["ctx_peak_tokens"],
-                "ctx_window": ctx["ctx_window"],
-            })
+        bd = by_date.setdefault(date_bucket, {
+            "date": date_bucket, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bd["sessions"] += 1
+        bd["cost"] += cost
+        bd["input_tokens"] += inp
+        bd["output_tokens"] += out
+        bd["cache_read_tokens"] += cr
+        bd["cache_creation_tokens"] += cw
+        bd["turns"] += turns
+        bd["duration_ms"] += dur
+
+        all_sessions.append({
+            "id": sid,
+            "date": date_bucket,
+            "model": model,
+            "provider": provider,
+            "cost": round(cost, 4),
+            "turns": turns,
+            "duration_ms": dur,
+            "calls_per_hr": round(calls_per_hr, 1),
+            "prompt": meta.get("prompt", "")[:200],
+            "cwd": meta.get("cwd", ""),
+            "ctx_peak_pct": ctx["ctx_peak_pct"],
+            "ctx_peak_tokens": ctx["ctx_peak_tokens"],
+            "ctx_window": ctx["ctx_window"],
+        })
 
     # Round totals for cleaner JSON; compute calls/hr from aggregated duration
     def _cph(turns: int, dur_ms: int) -> float:
@@ -704,13 +749,13 @@ def read_events(session_dir: Path) -> list:
     return events
 
 
-def resolve_session(date: str, session_id: str) -> Path | None:
+def resolve_session(session_id: str) -> Path | None:
     """Return the session dir if it exists AND is contained within AUDIT_DIR.
 
-    The containment check defends against path traversal via date/session_id
+    The containment check defends against path traversal via session_id
     components like "..", "/", or absolute paths injected through the URL.
     """
-    candidate = (AUDIT_DIR / date / session_id).resolve()
+    candidate = (AUDIT_DIR / session_id).resolve()
     try:
         candidate.relative_to(AUDIT_DIR.resolve())
     except ValueError:
@@ -1005,17 +1050,17 @@ class AuditHandler(SimpleHTTPRequestHandler):
             self._json(list_sessions())
         elif path.startswith("/api/sessions/") and path.endswith("/events"):
             parts = path.split("/")
-            # /api/sessions/<date>/<session-id>/events → 6 parts
-            if len(parts) == 6:
-                self._serve_events(parts[3], parts[4])
+            # /api/sessions/<session-id>/events → 5 parts
+            if len(parts) == 5:
+                self._serve_events(parts[3])
         elif path.startswith("/api/sessions/") and path.endswith("/stream"):
             parts = path.split("/")
-            if len(parts) == 6:
-                self._stream_events(parts[3], parts[4])
+            if len(parts) == 5:
+                self._stream_events(parts[3])
         elif path.startswith("/api/sessions/") and path.endswith("/meta"):
             parts = path.split("/")
-            if len(parts) == 6:
-                self._serve_meta(parts[3], parts[4])
+            if len(parts) == 5:
+                self._serve_meta(parts[3])
         elif path == "/api/memory":
             self._json(build_memory_index())
         elif path == "/api/memory/file":
@@ -1036,9 +1081,9 @@ class AuditHandler(SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path.startswith("/api/sessions/"):
             parts = path.split("/")
-            # /api/sessions/<date>/<session-id> → 5 parts
-            if len(parts) == 5:
-                self._delete_session(parts[3], parts[4])
+            # /api/sessions/<session-id> → 4 parts
+            if len(parts) == 4:
+                self._delete_session(parts[3])
                 return
         self.send_response(404)
         self.end_headers()
@@ -1051,8 +1096,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_events(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _serve_events(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1060,8 +1105,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
         events = read_events(session_dir)
         self._json(events)
 
-    def _stream_events(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _stream_events(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1157,8 +1202,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 try: fh.close()
                 except Exception: pass
 
-    def _serve_meta(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _serve_meta(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1246,14 +1291,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _delete_session(self, date: str, session_id: str):
+    def _delete_session(self, session_id: str):
         """Delete a session directory. Refuses only if the session is
         genuinely live (audit.jsonl was touched within the last
         ACTIVE_WINDOW_S seconds and hasn't emitted SessionEnd yet).
         Stuck directories from crashed sessions and sub-agent leftovers
         are freely deletable. ?force=1 overrides even a live session.
         """
-        session_dir = resolve_session(date, unquote(session_id))
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1273,15 +1318,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
             return
 
         # Cascade: also remove every sub-agent dir whose name starts with
-        # "<this_dir>__agent__". That covers direct children as well as
-        # grandchildren because __agent__ appears in every ancestor path.
-        # Note: this also cleans up if we're deleting a sub-agent itself —
-        # its own descendants (sub-sub-agents) share the same prefix.
-        date_dir = session_dir.parent
+        # "<this_dir>__agent__". Under flat layout these are siblings at
+        # AUDIT_DIR root, not under a date dir. Covers direct children
+        # plus grandchildren since __agent__ appears in every ancestor path.
+        siblings_root = session_dir.parent
         cascade_prefix = session_dir.name + SUBAGENT_SEP
         cascaded: list[str] = []
         try:
-            for sibling in date_dir.iterdir():
+            for sibling in siblings_root.iterdir():
                 if sibling.is_dir() and sibling.name.startswith(cascade_prefix):
                     try:
                         shutil.rmtree(sibling)
