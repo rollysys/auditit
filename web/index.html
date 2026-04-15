@@ -359,7 +359,11 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
       <button id="tabSkills" onclick="switchView('skills')">Skills</button>
     </div>
   </div>
-  <div>
+  <div style="display:flex;align-items:center;gap:10px">
+    <label id="scriptedToggle" style="font-size:11px;color:var(--gray);user-select:none;cursor:pointer">
+      <input type="checkbox" id="showScriptedChk" style="vertical-align:middle;margin-right:4px">
+      show scripted
+    </label>
     <button id="refreshBtn" onclick="refreshCurrentView()">↻ Refresh</button>
   </div>
 </div>
@@ -444,8 +448,15 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 
 <script>
 let currentStream = null;
-let allSessions = {};
+let allSessions = {};             // the UI-rendered subset (after scripted filter)
+let rawSessionsFlat = [];         // unfiltered array as returned by /api/sessions
 let activeSessionId = null;
+// When false (default), sessions where env.is_headless=true (i.e. the
+// parent Claude invocation was `claude -p`) are hidden from the list and
+// the dashboard. Toggled via the header checkbox. Persisted in localStorage
+// so the user's choice survives refreshes.
+let showScripted = false;
+try { showScripted = localStorage.getItem('auditit.showScripted') === '1'; } catch (e) {}
 let pendingToolCalls = {};
 // Stack of active sub-agents for the current session. Each element is
 // {agent_type, start_ts} pushed on SubagentStart and popped on SubagentStop.
@@ -456,16 +467,21 @@ let subagentStack = [];
 async function loadSessions() {
   const res = await fetch('/api/sessions');
   const body = await res.json();
-  // Server returns flat {sessions: [...]}. We group by last_active_at —
-  // a 4-day-old session that fired an event today belongs in "today" so
-  // the user finds it without scrolling. last_active_at is the timestamp
-  // of the LAST event in the audit log (server-derived), not a file
-  // mtime, so it is robust to migrations and any file rewrite.
-  // Within each group, sort by last_active_at descending so the most
-  // recently touched session is on top.
-  const list = body.sessions || [];
+  rawSessionsFlat = body.sessions || [];
+  _rebuildGroupedFromRaw();
+  renderList();
+  _updateScriptedToggleLabel();
+}
+
+function _rebuildGroupedFromRaw() {
+  // Group by last_active_at — a session that fired an event today
+  // belongs in "today" so the user finds it without scrolling. Within
+  // a group, sort by last_active_at desc. The scripted filter is
+  // applied here, not in the server response, so flipping the toggle
+  // does not require a network round-trip.
   const grouped = {};
-  for (const s of list) {
+  for (const s of rawSessionsFlat) {
+    if (!showScripted && s.mode === 'scripted') continue;
     const bucket = (s.last_active_at || s.started_at || '').substring(0, 10) || 'unknown';
     if (!grouped[bucket]) grouped[bucket] = [];
     grouped[bucket].push(s);
@@ -473,11 +489,44 @@ async function loadSessions() {
   for (const k of Object.keys(grouped)) {
     grouped[k].sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
   }
-  // Sort group keys descending so today is first.
   const ordered = {};
   for (const k of Object.keys(grouped).sort().reverse()) ordered[k] = grouped[k];
   allSessions = ordered;
-  renderList();
+}
+
+function _updateScriptedToggleLabel() {
+  const total = rawSessionsFlat.length;
+  const scripted = rawSessionsFlat.filter(s => s.mode === 'scripted').length;
+  const lbl = document.getElementById('scriptedToggle');
+  if (!lbl) return;
+  if (total === 0) { lbl.style.display = 'none'; return; }
+  lbl.style.display = '';
+  // Keep the checkbox + rewrite only the text after it
+  const chk = document.getElementById('showScriptedChk');
+  if (chk) chk.checked = showScripted;
+  lbl.childNodes.forEach(n => {
+    if (n.nodeType === 3) n.textContent = ` show scripted (${scripted}/${total} hidden)`;
+  });
+  // Simpler fallback: overwrite label contents, preserving the input.
+  lbl.innerHTML = '';
+  const input = document.createElement('input');
+  input.type = 'checkbox'; input.id = 'showScriptedChk';
+  input.style.verticalAlign = 'middle'; input.style.marginRight = '4px';
+  input.checked = showScripted;
+  input.addEventListener('change', () => {
+    showScripted = input.checked;
+    try { localStorage.setItem('auditit.showScripted', showScripted ? '1' : '0'); } catch (e) {}
+    _rebuildGroupedFromRaw();
+    renderList();
+    // If we're on the dashboard, reload to re-filter its tables too.
+    if (currentView === 'dashboard') loadDashboard();
+  });
+  lbl.appendChild(input);
+  lbl.appendChild(document.createTextNode(
+    showScripted
+      ? ` show scripted (${scripted} total)`
+      : ` show scripted (${scripted} hidden)`
+  ));
 }
 
 function _basename(p) {
@@ -1317,7 +1366,8 @@ async function loadDashboard() {
   dashboardChartsInstances.forEach(c => { try { c.destroy(); } catch (e) {} });
   dashboardChartsInstances = [];
   try {
-    const res = await fetch('/api/stats');
+    const url = showScripted ? '/api/stats' : '/api/stats?exclude_scripted=1';
+    const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const s = await res.json();
     renderDashboard(s);

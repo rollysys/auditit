@@ -35,21 +35,75 @@ def _parse_ts(s):
         return None
 
 
+def _parent_cmdline() -> str:
+    """Return the ppid's command line (macOS: `ps -p PPID -o command=`).
+
+    The parent of this hook is the Claude Code process itself. Its argv
+    is the cleanest signal we have for "was this invoked as `claude -p`"
+    (scripted / headless) vs an interactive session. Empty string on any
+    failure. Stays best-effort so a weird platform never breaks the hook.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(os.getppid()), "-o", "command="],
+            text=True, stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return out.strip()
+    except Exception:
+        return ""
+
+
+def _is_headless(parent_cmd: str) -> bool:
+    """True iff the parent Claude invocation carries `-p` / `--print`.
+
+    Matches both the short `-p` flag (as its own argv token) and the
+    long form `--print`. Does NOT match `-p=foo` style (Claude Code
+    does not accept it). Also does not match `-p` embedded inside a
+    longer prompt string passed as a separate argv; ps collapses argv
+    into a single space-separated line, so we have to be careful about
+    false positives from prompt text containing " -p " substrings. As
+    a pragmatic compromise we only check the FIRST few tokens after
+    the program name — the flag always comes before the prompt.
+    """
+    if not parent_cmd:
+        return False
+    parts = parent_cmd.split()
+    # Look at everything up to (but not including) the first argv that
+    # starts with something that smells like a prompt — heuristically,
+    # anything over 40 chars without a leading dash is probably prompt.
+    for tok in parts[1:]:
+        if not tok.startswith("-") and len(tok) > 40:
+            break
+        if tok == "-p" or tok == "--print" or tok.startswith("--print="):
+            return True
+    return False
+
+
 def _write_env_file(session_dir: Path) -> None:
-    """Capture provider-relevant env on first event for this session.
+    """Capture provider + mode signals on first event for this session.
 
     ANTHROPIC_BASE_URL is the authoritative signal for third-party proxies
     (moonshot / zhipu / qwen / deepseek / ...). Bedrock and Vertex use their
     own boolean flags. These live only in the process environment, never in
     the transcript, so hook time is the only chance to capture them.
+
+    parent_cmd is the argv of the Claude Code process that spawned us —
+    used to classify the session as interactive vs scripted (headless).
+    claude_code_entrypoint distinguishes SDK vs plain CLI but does not
+    by itself tell us interactive vs headless; parent_cmd does.
     """
     env_path = session_dir / "env.json"
     if env_path.exists():
         return
+    parent_cmd = _parent_cmdline()
     data = {
-        "anthropic_base_url": os.environ.get("ANTHROPIC_BASE_URL", ""),
-        "use_bedrock":        os.environ.get("CLAUDE_CODE_USE_BEDROCK", ""),
-        "use_vertex":         os.environ.get("CLAUDE_CODE_USE_VERTEX", ""),
+        "anthropic_base_url":       os.environ.get("ANTHROPIC_BASE_URL", ""),
+        "use_bedrock":              os.environ.get("CLAUDE_CODE_USE_BEDROCK", ""),
+        "use_vertex":               os.environ.get("CLAUDE_CODE_USE_VERTEX", ""),
+        "claude_code_entrypoint":   os.environ.get("CLAUDE_CODE_ENTRYPOINT", ""),
+        "parent_cmd":               parent_cmd,
+        "is_headless":              _is_headless(parent_cmd),
     }
     try:
         with open(env_path, "w") as f:

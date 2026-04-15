@@ -389,6 +389,7 @@ def list_sessions() -> dict:
 
         sub_meta = _load_subagent_meta(session_dir)
         is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
+        env = _load_env(session_dir)
 
         if is_subagent:
             parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
@@ -399,6 +400,7 @@ def list_sessions() -> dict:
             depth      = sid.count(SUBAGENT_SEP)
             root_name = sid.split(SUBAGENT_SEP, 1)[0]
             root_meta = parent_meta_cache.get(root_name, {})
+            root_env  = _load_env(AUDIT_DIR / root_name) if (AUDIT_DIR / root_name).is_dir() else {}
             sessions.append({
                 "id": sid,
                 "prompt": description,
@@ -418,6 +420,9 @@ def list_sessions() -> dict:
                 "agent_type": agent_type,
                 "depth": depth,
                 "reason": summary.get("reason", ""),
+                # Inherit mode from root session — a sub-agent of a
+                # scripted run is itself scripted for filtering purposes.
+                "mode": detect_mode(root_env or env),
             })
         else:
             meta = parent_meta_cache.get(sid, {})
@@ -439,6 +444,7 @@ def list_sessions() -> dict:
                 "parent_session_id": "",
                 "root_session_id": sid,
                 "depth": 0,
+                "mode": detect_mode(env),
             })
 
     return {"sessions": sessions}
@@ -552,6 +558,20 @@ def _load_env(session_dir: Path) -> dict:
         return {}
 
 
+def detect_mode(env: dict | None = None) -> str:
+    """Return "scripted" or "interactive" based on env.json flags.
+
+    Scripted = the parent Claude process was invoked with `-p` / `--print`
+    (headless). Interactive = anything else. Historical sessions without
+    env.json default to "interactive" (most common, and we do not want to
+    hide them retroactively).
+    """
+    env = env or {}
+    if env.get("is_headless") is True:
+        return "scripted"
+    return "interactive"
+
+
 def detect_provider(model: str, env: dict | None = None) -> str:
     """Infer the API provider, preferring env-based signals over model name.
 
@@ -598,12 +618,16 @@ def detect_provider(model: str, env: dict | None = None) -> str:
     return "other"
 
 
-def build_stats() -> dict:
+def build_stats(exclude_scripted: bool = False) -> dict:
     """Aggregate across all main sessions for the Dashboard view.
 
     Sub-agent directories are skipped — their token/cost usage is already
     captured in the parent session's transcript, so counting them would
     double-count.
+
+    When `exclude_scripted=True`, sessions whose env.json marks them as
+    headless (claude -p invocation) are omitted from every aggregate.
+    The frontend passes this flag when its scripted-filter toggle is off.
 
     Returns:
       totals: totals across all sessions (session count, cost, tokens,
@@ -656,6 +680,8 @@ def build_stats() -> dict:
 
         meta = _load_meta(session_dir, sid)
         env  = _load_env(session_dir)
+        if exclude_scripted and detect_mode(env) == "scripted":
+            continue
         model = summary.get("model", "") or meta.get("model", "") or "unknown"
         provider = detect_provider(model, env)
         cost = compute_cost(model, usage)
@@ -732,6 +758,7 @@ def build_stats() -> dict:
             "date": date_bucket,
             "model": model,
             "provider": provider,
+            "mode": detect_mode(env),
             "cost": round(cost, 4),
             "turns": turns,
             "duration_ms": dur,
@@ -1155,7 +1182,10 @@ class AuditHandler(SimpleHTTPRequestHandler):
         elif path == "/api/version":
             self._json(REPO_VERSION)
         elif path == "/api/stats":
-            self._json(build_stats())
+            from urllib.parse import parse_qs
+            qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            exclude = (qs.get("exclude_scripted") or ["0"])[0] in ("1", "true", "yes")
+            self._json(build_stats(exclude_scripted=exclude))
         elif path == "/api/skills":
             self._json(list_skills())
         elif path == "/api/skills/file":
