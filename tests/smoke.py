@@ -210,6 +210,208 @@ def test_subagent_slicing():
         assert_ok("sub gz exists", (sub / "audit.jsonl.gz").exists())
 
 
+def test_single_session_multi_tool_capture():
+    """Realistic single session with several tool types and one failure.
+
+    Verifies that every event is appended in order with correct tool_name,
+    that PostToolUseFailure is preserved as a distinct event, and that
+    SessionEnd produces a gzip whose line count matches the input.
+    """
+    print("test_single_session_multi_tool_capture")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        sid = "test-sid-multi-tool"
+
+        events = [
+            ("PreToolUse",         {"session_id": sid, "tool_name": "Read",
+                                     "tool_input": {"file_path": "/x/a.py"}}),
+            ("PostToolUse",        {"session_id": sid, "tool_name": "Read",
+                                     "tool_response": {"type": "text", "file": {}}}),
+            ("PreToolUse",         {"session_id": sid, "tool_name": "Bash",
+                                     "tool_input": {"command": "ls /tmp"}}),
+            ("PostToolUse",        {"session_id": sid, "tool_name": "Bash",
+                                     "tool_response": {"stdout": "x\n", "stderr": ""}}),
+            ("PreToolUse",         {"session_id": sid, "tool_name": "Edit",
+                                     "tool_input": {"file_path": "/x/a.py",
+                                                    "old_string": "old", "new_string": "new"}}),
+            ("PostToolUseFailure", {"session_id": sid, "tool_name": "Edit",
+                                     "tool_input": {"file_path": "/x/a.py"}}),
+            ("PreToolUse",         {"session_id": sid, "tool_name": "Grep",
+                                     "tool_input": {"pattern": "foo"}}),
+            ("PostToolUse",        {"session_id": sid, "tool_name": "Grep",
+                                     "tool_response": {"numFiles": 2, "numLines": 5}}),
+            ("Stop",               {"session_id": sid}),
+        ]
+        for ev, payload in events:
+            assert_eq(f"rc {ev}", run_hook(ev, payload, {}, home), 0)
+
+        d = today_dir(home, sid)
+        lines = (d / "audit.jsonl").read_text().splitlines()
+        assert_eq("audit lines before SessionEnd", len(lines), len(events))
+
+        # Ordering and event/tool round-trip
+        for i, (ev_expected, payload_expected) in enumerate(events):
+            rec = json.loads(lines[i])
+            assert_eq(f"line {i} event", rec["event"], ev_expected)
+            tn = payload_expected.get("tool_name", "")
+            if tn:
+                assert_eq(f"line {i} tool_name", rec["data"].get("tool_name"), tn)
+
+        # Specifically: PostToolUseFailure preserved as its own event,
+        # not folded into PostToolUse.
+        events_seen = [json.loads(l)["event"] for l in lines]
+        assert_ok("PostToolUseFailure preserved",
+                  events_seen.count("PostToolUseFailure") == 1,
+                  f"events_seen={events_seen}")
+
+        # SessionEnd with no transcript still triggers gzip.
+        rc = run_hook("SessionEnd",
+                      {"session_id": sid, "transcript_path": "", "reason": "exit"},
+                      {}, home)
+        assert_eq("rc SessionEnd", rc, 0)
+        assert_ok("plain jsonl gone after SessionEnd",
+                  not (d / "audit.jsonl").exists())
+        assert_ok("gz exists", (d / "audit.jsonl.gz").exists())
+        with gzip.open(d / "audit.jsonl.gz", "rt") as f:
+            gz_lines = [l for l in f if l.strip()]
+        # Original 9 events + SessionEnd itself = 10
+        assert_eq("gz line count", len(gz_lines), len(events) + 1)
+        # Per-line event/tool fields survived gzip intact
+        gz_events = [json.loads(l)["event"] for l in gz_lines]
+        assert_eq("gz events match",
+                  gz_events,
+                  [ev for ev, _ in events] + ["SessionEnd"])
+
+
+def test_nested_subagent_slicing():
+    """Two levels of nested sub-agents.
+
+    Layout (events written to parent audit.jsonl in order):
+       1  PreToolUse(Task)        ← parent fires Task to spawn agt-1
+       2  SubagentStart(agt-1)
+       3  PreToolUse(Bash)        ← inside agt-1
+       4  PostToolUse(Bash)
+       5  PreToolUse(Task)        ← agt-1 fires Task to spawn agt-2
+       6  SubagentStart(agt-2)    ← nested
+       7  PreToolUse(Read)        ← inside agt-2
+       8  PostToolUse(Read)
+       9  SubagentStop(agt-2)
+      10  PreToolUse(Edit)        ← back inside agt-1
+      11  PostToolUse(Edit)
+      12  SubagentStop(agt-1)
+
+    Then SessionEnd. Slicing must produce two sub-agent dirs:
+      - <sid>__agent__agt-1            : events 2..12 mirrored (11 lines)
+      - <sid>__agent__agt-1__agent__agt-2 : events 6..9 (4 lines)
+    Parent gz keeps everything (12 + SessionEnd = 13 lines).
+    """
+    print("test_nested_subagent_slicing")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        sid = "test-sid-nested"
+
+        events = [
+            ("PreToolUse",     {"session_id": sid, "tool_name": "Task",
+                                 "tool_input": {"description": "outer work",
+                                                "subagent_type": "Explore",
+                                                "prompt": "p"}}),
+            ("SubagentStart",  {"session_id": sid, "agent_id": "agt-1",
+                                 "agent_type": "Explore"}),
+            ("PreToolUse",     {"session_id": sid, "tool_name": "Bash",
+                                 "tool_input": {"command": "ls"}}),
+            ("PostToolUse",    {"session_id": sid, "tool_name": "Bash",
+                                 "tool_response": {"stdout": ""}}),
+            ("PreToolUse",     {"session_id": sid, "tool_name": "Task",
+                                 "tool_input": {"description": "inner work",
+                                                "subagent_type": "Plan",
+                                                "prompt": "p2"}}),
+            ("SubagentStart",  {"session_id": sid, "agent_id": "agt-2",
+                                 "agent_type": "Plan"}),
+            ("PreToolUse",     {"session_id": sid, "tool_name": "Read",
+                                 "tool_input": {"file_path": "/x/y"}}),
+            ("PostToolUse",    {"session_id": sid, "tool_name": "Read",
+                                 "tool_response": {"type": "text"}}),
+            ("SubagentStop",   {"session_id": sid, "agent_id": "agt-2"}),
+            ("PreToolUse",     {"session_id": sid, "tool_name": "Edit",
+                                 "tool_input": {"file_path": "/x/y",
+                                                "old_string": "a", "new_string": "b"}}),
+            ("PostToolUse",    {"session_id": sid, "tool_name": "Edit",
+                                 "tool_response": {"filePath": "/x/y"}}),
+            ("SubagentStop",   {"session_id": sid, "agent_id": "agt-1"}),
+        ]
+        for ev, payload in events:
+            assert_eq(f"rc {ev}", run_hook(ev, payload, {}, home), 0)
+
+        rc = run_hook("SessionEnd",
+                      {"session_id": sid, "transcript_path": "", "reason": "exit"},
+                      {}, home)
+        assert_eq("rc SessionEnd", rc, 0)
+
+        d = today_dir(home, sid)
+        date_dir = d.parent
+
+        # ── Parent: audit.jsonl gzipped, contains every event + SessionEnd
+        assert_ok("parent plain jsonl gone", not (d / "audit.jsonl").exists())
+        assert_ok("parent gz exists", (d / "audit.jsonl.gz").exists())
+        with gzip.open(d / "audit.jsonl.gz", "rt") as f:
+            parent_lines = [l for l in f if l.strip()]
+        assert_eq("parent gz line count", len(parent_lines), len(events) + 1)
+
+        # ── Layer 1: <sid>__agent__agt-1
+        l1 = date_dir / f"{sid}__agent__agt-1"
+        assert_ok("layer1 dir exists", l1.is_dir(), str(l1))
+        assert_ok("layer1 plain gone", not (l1 / "audit.jsonl").exists())
+        assert_ok("layer1 gz exists",  (l1 / "audit.jsonl.gz").exists())
+        with gzip.open(l1 / "audit.jsonl.gz", "rt") as f:
+            l1_lines = [l for l in f if l.strip()]
+        # Events 2..12 inclusive = 11 lines
+        assert_eq("layer1 line count", len(l1_lines), 11)
+        l1_events = [json.loads(l)["event"] for l in l1_lines]
+        assert_eq("layer1 first event", l1_events[0], "SubagentStart")
+        assert_eq("layer1 last event",  l1_events[-1], "SubagentStop")
+        # Layer1 must include the nested layer2's events (mirrored)
+        assert_ok("layer1 contains nested SubagentStart",
+                  l1_events.count("SubagentStart") == 2,
+                  f"events={l1_events}")
+        assert_ok("layer1 contains nested SubagentStop",
+                  l1_events.count("SubagentStop") == 2)
+
+        l1_meta = json.loads((l1 / "meta.json").read_text())
+        assert_eq("l1.meta.agent_id",         l1_meta["agent_id"], "agt-1")
+        assert_eq("l1.meta.parent_session_id", l1_meta["parent_session_id"], sid)
+        assert_eq("l1.meta.description",      l1_meta["description"], "outer work")
+
+        l1_summary = json.loads((l1 / "summary.json").read_text())
+        assert_eq("l1.is_subagent",  l1_summary["is_subagent"], True)
+        # Tool calls inside layer1: Bash, Read (from nested mirror), Edit = 3
+        assert_eq("l1.num_tool_calls", l1_summary["num_tool_calls"], 3)
+
+        # ── Layer 2 (nested): <sid>__agent__agt-1__agent__agt-2
+        l2 = date_dir / f"{sid}__agent__agt-1__agent__agt-2"
+        assert_ok("layer2 dir exists", l2.is_dir(), str(l2))
+        assert_ok("layer2 gz exists", (l2 / "audit.jsonl.gz").exists())
+        with gzip.open(l2 / "audit.jsonl.gz", "rt") as f:
+            l2_lines = [l for l in f if l.strip()]
+        # Events 6..9 inclusive = 4 lines
+        assert_eq("layer2 line count", len(l2_lines), 4)
+        l2_events = [json.loads(l)["event"] for l in l2_lines]
+        assert_eq("layer2 events sequence", l2_events,
+                  ["SubagentStart", "PreToolUse", "PostToolUse", "SubagentStop"])
+
+        l2_meta = json.loads((l2 / "meta.json").read_text())
+        assert_eq("l2.meta.agent_id",         l2_meta["agent_id"], "agt-2")
+        # parent_session_id of nested layer is the IMMEDIATE parent layer name,
+        # not the root sid
+        assert_eq("l2.meta.parent_session_id",
+                  l2_meta["parent_session_id"],
+                  f"{sid}__agent__agt-1")
+        assert_eq("l2.meta.description",      l2_meta["description"], "inner work")
+
+        l2_summary = json.loads((l2 / "summary.json").read_text())
+        # Only Read inside layer2 = 1 tool call
+        assert_eq("l2.num_tool_calls", l2_summary["num_tool_calls"], 1)
+
+
 def main():
     failed = 0
     for fn in [
@@ -217,6 +419,8 @@ def main():
         test_failure_safe_on_bad_input,
         test_session_end_with_transcript_skips_synthetic,
         test_subagent_slicing,
+        test_single_session_multi_tool_capture,
+        test_nested_subagent_slicing,
     ]:
         try:
             fn()
