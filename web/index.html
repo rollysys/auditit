@@ -452,9 +452,13 @@ let subagentStack = [];
 async function loadSessions() {
   const res = await fetch('/api/sessions');
   const body = await res.json();
-  // Server returns flat {sessions: [...]} (no date partitioning). Group
-  // client-side by last_active_at date for the UI's "today / yesterday"
-  // sticky headers. Fall back to started_at, then to "unknown".
+  // Server returns flat {sessions: [...]}. We group by last_active_at —
+  // a 4-day-old session that fired an event today belongs in "today" so
+  // the user finds it without scrolling. last_active_at is the timestamp
+  // of the LAST event in the audit log (server-derived), not a file
+  // mtime, so it is robust to migrations and any file rewrite.
+  // Within each group, sort by last_active_at descending so the most
+  // recently touched session is on top.
   const list = body.sessions || [];
   const grouped = {};
   for (const s of list) {
@@ -462,7 +466,10 @@ async function loadSessions() {
     if (!grouped[bucket]) grouped[bucket] = [];
     grouped[bucket].push(s);
   }
-  // Sort dates descending so newest group is first
+  for (const k of Object.keys(grouped)) {
+    grouped[k].sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
+  }
+  // Sort group keys descending so today is first.
   const ordered = {};
   for (const k of Object.keys(grouped).sort().reverse()) ordered[k] = grouped[k];
   allSessions = ordered;

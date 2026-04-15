@@ -241,26 +241,98 @@ def _load_subagent_meta(session_dir: Path) -> dict | None:
 
 
 def _last_active_iso(session_dir: Path) -> str:
-    """ISO-8601 UTC of the most recent file mtime in the session dir.
+    """ISO-8601 UTC of the LAST EVENT in the session's audit log.
 
-    Used as a stable proxy for "session last touched" without re-parsing
-    the audit.jsonl tail. Falls back to "" if the dir has no files.
+    Reads the last line of audit.jsonl (or .gz) and parses its `ts`. This
+    is the truth: file mtimes can be bumped by migrations, cp, tar, or any
+    write — but every event line carries its own timestamp.
+
+    Cached into metadata.json keyed by the audit file's current size so we
+    only re-read when the file actually grew. For finished sessions (.gz)
+    the cache is permanent because the file size never changes again.
+    Returns "" when the session has no readable events.
     """
-    latest = 0.0
+    jsonl = session_dir / "audit.jsonl"
+    gz    = session_dir / "audit.jsonl.gz"
+    if jsonl.exists():
+        src = jsonl
+    elif gz.exists():
+        src = gz
+    else:
+        return ""
     try:
-        for p in session_dir.iterdir():
-            try:
-                m = p.stat().st_mtime
-                if m > latest:
-                    latest = m
-            except OSError:
-                continue
+        size = src.stat().st_size
     except OSError:
         return ""
-    if not latest:
+
+    # Cache lookup
+    meta_path = session_dir / "metadata.json"
+    cached = None
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                cached = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            cached = None
+    if cached and cached.get("_last_active_src") == src.name \
+            and cached.get("_last_active_size") == size \
+            and cached.get("last_active_at"):
+        return cached["last_active_at"]
+
+    # Recompute: pull the LAST non-empty line from the audit log.
+    last_line = b""
+    try:
+        if src.name.endswith(".gz"):
+            with gzip.open(src, "rb") as f:
+                for line in f:
+                    if line.strip():
+                        last_line = line
+        else:
+            # Tail read — seek backward in 8KB chunks until we have at least
+            # one full newline-terminated line. Avoids decompressing or
+            # walking very long files.
+            with open(src, "rb") as f:
+                f.seek(0, 2)
+                end = f.tell()
+                if not end:
+                    return ""
+                chunk = 8192
+                tail = b""
+                pos = end
+                while pos > 0 and tail.count(b"\n") < 2:
+                    pos = max(0, pos - chunk)
+                    f.seek(pos)
+                    tail = f.read(end - pos)
+                # Last non-empty line of tail
+                for line in reversed(tail.splitlines()):
+                    if line.strip():
+                        last_line = line
+                        break
+    except OSError:
         return ""
-    from datetime import datetime as _dt, timezone as _tz
-    return _dt.fromtimestamp(latest, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if not last_line:
+        return ""
+    try:
+        obj = json.loads(last_line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    ts = obj.get("ts", "") or ""
+
+    # Write through the cache (best-effort; never raise).
+    if ts and meta_path.parent.exists():
+        try:
+            new_meta = dict(cached) if isinstance(cached, dict) else {}
+            new_meta["last_active_at"]    = ts
+            new_meta["_last_active_src"]  = src.name
+            new_meta["_last_active_size"] = size
+            tmp = meta_path.with_name(meta_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(new_meta, f, indent=2)
+            os.replace(tmp, meta_path)
+        except OSError:
+            pass
+    return ts
 
 
 def list_sessions() -> dict:
