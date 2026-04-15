@@ -56,6 +56,14 @@ MARKER = "# auditit"
 
 SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 
+# Stable install destination for the hook script. We COPY the source script
+# here on every install so settings.json never references a path inside a
+# git working tree — checking out a branch that lacks the file would
+# otherwise brick every Claude Code session globally (see
+# feedback_hook_install_copy.md). Re-run `install.py install` after editing
+# the source to refresh the copy.
+INSTALL_HOOK_DIR = Path.home() / ".claude" / "hooks" / "auditit"
+
 # 25 events, derived from docs/claude-code-hooks.md (Claude Code hooks ref).
 # See that file for the full table of fields and matcher support.
 # FileChanged is deliberately omitted — see module docstring.
@@ -290,15 +298,48 @@ def _preflight(hook_path: Path, *, require_hook: bool = True) -> list[str]:
 
 # ── Commands ─────────────────────────────────────────────────────────
 
+def _install_hook_copy(src: Path, dry_run: bool) -> Path:
+    """Copy the hook script into INSTALL_HOOK_DIR and return the dest path.
+
+    Decouples the installed hook from the repo working tree. If src and dst
+    are byte-for-byte identical we skip the write to avoid pointless mtime
+    bumps. Atomic via tempfile + os.replace so a partial copy never leaves
+    a corrupt installed hook.
+    """
+    import shutil
+    dst = INSTALL_HOOK_DIR / src.name
+    if dry_run:
+        return dst
+    INSTALL_HOOK_DIR.mkdir(parents=True, exist_ok=True)
+    src_bytes = src.read_bytes()
+    if dst.exists() and dst.read_bytes() == src_bytes:
+        return dst
+    fd, tmp = tempfile.mkstemp(dir=str(INSTALL_HOOK_DIR), prefix=".hook.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(src_bytes)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+    except Exception:
+        try: os.remove(tmp)
+        except OSError: pass
+        raise
+    return dst
+
+
 def cmd_install(args: argparse.Namespace) -> int:
-    hook_path = _resolve_hook_path(args.hook)
-    problems = _preflight(hook_path)
+    src_hook = _resolve_hook_path(args.hook)
+    problems = _preflight(src_hook)
     if problems and not args.force:
         _err("pre-flight checks failed:")
         for p in problems:
             _err(f"  - {p}")
         _err("re-run with --force to override (not recommended)")
         return 2
+
+    # Copy the source hook to a stable location under ~/.claude/ so
+    # settings.json never references the repo working tree.
+    hook_path = _install_hook_copy(src_hook, args.dry_run)
 
     with _settings_lock():
         settings = _load_settings()
@@ -333,6 +374,8 @@ def cmd_install(args: argparse.Namespace) -> int:
             _log(f"  add:     {', '.join(plan_add)}")
         if plan_replace:
             _log(f"  replace: {', '.join(plan_replace)}")
+        _log(f"  source:  {src_hook}")
+        _log(f"  copy to: {hook_path}")
         _log(f"  hook:    bash {hook_path} <Event> {MARKER}")
         _log(f"  target:  {SETTINGS_PATH}")
 
