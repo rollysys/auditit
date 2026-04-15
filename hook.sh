@@ -25,6 +25,33 @@ JSONL="${SESSION_DIR}/audit.jsonl"
 
 [ -d "$SESSION_DIR" ] || mkdir -p "$SESSION_DIR"
 
+# Capture provider-relevant env on first event for this session.
+# ANTHROPIC_BASE_URL is the authoritative signal for third-party proxies
+# (moonshot / zhipu / qwen / deepseek / ...). Bedrock and Vertex use their
+# own boolean flags. These live only in the process environment, never in
+# the transcript, so hook time is the only chance to capture them.
+ENV_JSON_PATH="${SESSION_DIR}/env.json"
+if [ ! -f "$ENV_JSON_PATH" ]; then
+    ABU="${ANTHROPIC_BASE_URL:-}"
+    CCB="${CLAUDE_CODE_USE_BEDROCK:-}"
+    CCV="${CLAUDE_CODE_USE_VERTEX:-}"
+    export ENV_JSON_PATH ABU CCB CCV
+    # NOTE: no apostrophes anywhere in this python block — outer bash single
+    # quotes would terminate early. Strings use double quotes.
+    python3 -c '
+import os, json
+path = os.environ.get("ENV_JSON_PATH", "")
+if path and not os.path.exists(path):
+    data = {
+        "anthropic_base_url": os.environ.get("ABU", ""),
+        "use_bedrock":        os.environ.get("CCB", ""),
+        "use_vertex":         os.environ.get("CCV", ""),
+    }
+    with open(path, "w") as f:
+        json.dump(data, f)
+' 2>/dev/null
+fi
+
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 printf '%s\n' "{\"ts\":\"${TS}\",\"event\":\"${EVENT}\",\"data\":${INPUT}}" >> "$JSONL"
 
