@@ -382,12 +382,35 @@ def _main():
         _handle_session_end(session_dir, data)
 
 
+def _log_safety_net_error(exc: BaseException) -> None:
+    """Best-effort log of a swallowed exception to ~/.claude-audit/_hook_errors.log.
+
+    Without this, `except Exception: pass` silently loses every bug forever
+    and audit data can quietly degrade for weeks before anyone notices.
+    Any failure here is itself swallowed — the safety net must not raise.
+    """
+    try:
+        import traceback
+        AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = AUDIT_DIR / "_hook_errors.log"
+        event = sys.argv[1] if len(sys.argv) > 1 else ""
+        with open(log_path, "a") as f:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            f.write(f"{ts} event={event} {type(exc).__name__}: {exc}\n")
+            traceback.print_exc(file=f)
+            f.write("\n")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     # Top-level safety net: any unexpected error must NOT propagate. A
     # non-zero exit from a Claude Code hook can block tool execution
     # globally, so we silently drop bugs at the price of one missed audit.
+    # We do log the error to _hook_errors.log so silent failures are at
+    # least discoverable after the fact.
     try:
         _main()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_safety_net_error(exc)
     sys.exit(0)
