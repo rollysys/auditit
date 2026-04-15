@@ -748,6 +748,10 @@ function loadEvents(sessionId, isActive) {
       pendingToolCalls = {};
       subagentStack = [];
       events.forEach(e => processEvent(e, log));
+      // Auto-scroll to the latest event on initial load. SSE updates
+      // already do this; this matches the behaviour for fetch-only
+      // (completed sessions and the initial paint of live ones).
+      log.scrollTop = log.scrollHeight;
     })
     .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
 
