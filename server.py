@@ -383,27 +383,97 @@ def _extract_meta_from_events(session_dir: Path, sid: str) -> dict:
     return meta
 
 
-def detect_provider(model: str) -> str:
-    """Infer the API provider from the model name string.
+# Known third-party proxy hostnames → canonical provider name. Matched by
+# substring against the netloc of ANTHROPIC_BASE_URL (captured at hook time
+# into <session>/env.json). Keep this short — when the host is not matched
+# we fall back to the raw host for display.
+PROVIDER_HOSTS: list[tuple[str, str]] = [
+    ("moonshot.cn",        "moonshot"),
+    ("moonshot.ai",        "moonshot"),
+    ("kimi.moonshot",      "moonshot"),
+    ("z.ai",               "zhipu"),
+    ("bigmodel.cn",        "zhipu"),
+    ("dashscope.aliyuncs", "qwen"),
+    ("dashscope-intl",     "qwen"),
+    ("deepseek.com",       "deepseek"),
+    ("api.openai.com",     "openai"),
+    ("bedrock-runtime",    "bedrock"),
+    ("bedrock.",           "bedrock"),
+    ("aiplatform.google",  "vertex"),
+    ("api.x.ai",           "xai"),
+    ("api.anthropic.com",  "anthropic"),
+]
 
-    Pure heuristic — we do not capture ANTHROPIC_BASE_URL or
-    CLAUDE_CODE_USE_BEDROCK in summary.json today, so the model string is
-    all we have. Good enough when provider correlates with model family.
+
+def _host_of(url: str) -> str:
+    if not url:
+        return ""
+    u = url.strip()
+    # Strip scheme
+    if "://" in u:
+        u = u.split("://", 1)[1]
+    # Keep only netloc (drop path/query)
+    for sep in ("/", "?", "#"):
+        if sep in u:
+            u = u.split(sep, 1)[0]
+    # Drop port
+    if ":" in u:
+        u = u.split(":", 1)[0]
+    return u.lower()
+
+
+def _load_env(session_dir: Path) -> dict:
+    """Return env.json content (ANTHROPIC_BASE_URL / Bedrock / Vertex flags).
+
+    Written by hook.sh on the first event of each session. Missing file
+    means a pre-env-capture session (historical) — caller falls back to
+    model-name heuristics in that case.
     """
+    p = session_dir / "env.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def detect_provider(model: str, env: dict | None = None) -> str:
+    """Infer the API provider, preferring env-based signals over model name.
+
+    Priority:
+      1. env.json flags: use_bedrock / use_vertex → bedrock / vertex
+      2. env.json anthropic_base_url → known-host map or raw host
+      3. model name prefix (historical sessions with no env.json)
+    """
+    env = env or {}
+    if str(env.get("use_bedrock", "")).lower() in ("1", "true", "yes"):
+        return "bedrock"
+    if str(env.get("use_vertex", "")).lower() in ("1", "true", "yes"):
+        return "vertex"
+    base_url = env.get("anthropic_base_url", "") or ""
+    host = _host_of(base_url)
+    if host:
+        for needle, name in PROVIDER_HOSTS:
+            if needle in host:
+                return name
+        # Unmapped third-party host — return the host as the provider label
+        # so the UI still renders something meaningful (e.g. "api.foo.com").
+        return host
+
+    # Historical fallback: model-name prefix heuristic
     if not model:
         return "unknown"
     m = model.lower().strip()
     if m == "<synthetic>":
         return "synthetic"
-    # Bedrock: "anthropic.claude-..." or "us.anthropic.claude-..."
     if m.startswith("anthropic.") or ".anthropic." in m:
         return "bedrock"
-    # Vertex AI: "claude-opus-4-1@20250805" style
     if "@" in m and "claude-" in m:
         return "vertex"
     if m.startswith("claude-"):
         return "anthropic"
-    # Common third-party OpenAI-compatible endpoints (via ANTHROPIC_BASE_URL override)
     if m.startswith("qwen"):     return "qwen"
     if m.startswith("glm"):      return "zhipu"
     if m.startswith("kimi") or m.startswith("moonshot"): return "moonshot"
@@ -470,8 +540,9 @@ def build_stats() -> dict:
                       + int(usage.get("cache_creation_1h_tokens", 0) or 0))
 
             meta = _load_meta(session_dir, sid)
+            env  = _load_env(session_dir)
             model = summary.get("model", "") or meta.get("model", "") or "unknown"
-            provider = detect_provider(model)
+            provider = detect_provider(model, env)
             cost = compute_cost(model, usage)
             dur  = int(summary.get("duration_ms", 0) or 0)
             turns = int(summary.get("num_turns", 0) or 0)
