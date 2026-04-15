@@ -194,17 +194,218 @@ def _atomic_gzip(jsonl_path: Path) -> bool:
 
 # ===== Sub-agent slicing =====
 #
-# Walk the parent audit.jsonl; every SubagentStart opens a new sub-agent
-# directory at <date>/<immediate_parent_name>__agent__<agent_id>/. Every
-# event between a matching Start/Stop is appended to the new layer AND to
-# every ancestor layer still open on the stack. On Stop, the layer is
-# finalized: meta.json + summary.json + atomic gzip + delete plain jsonl.
-# Any layers left unclosed at EOF (crashed sub-agent) are still finalized
-# with reason="unclosed".
+# Empirical reality of Claude Code hooks (verified 2026-04-16):
+#   - `SubagentStart` never fires in practice (0 of >40 observed sub-agents
+#     across two live sessions produced a Start hook event).
+#   - `SubagentStop` fires in two shapes:
+#       A. Explicit spawn (Task / Agent tool) — agent_type non-empty
+#          ("Explore" / "general-purpose" / etc.). Claude Code persists
+#          the full sub-agent transcript at
+#            ~/.claude/projects/<encoded>/<parent_sid>/subagents/agent-<id>.jsonl
+#          with a sibling agent-<id>.meta.json of
+#            {"agentType": "...", "description": "..."}.
+#       B. Internal state-summary agent — agent_type is the empty string,
+#          no transcript is persisted, and last_assistant_message is a
+#          "Goal / Current / Next" conversation snapshot. These are NOT
+#          real sub-agent sessions; they are Claude Code's own turn-end
+#          summariser. We leave them in the parent audit stream to be
+#          rendered inline as "📸 CHECKPOINT" rows by the web UI.
 #
-# The parent audit.jsonl itself is never touched here — it remains the
-# source of truth and is compressed by _atomic_gzip afterwards.
+# So: we slice (type A) only. For each SubagentStop with non-empty
+# agent_type, we read the transcript + meta.json and synthesise a
+# sub-agent dir <siblings_root>/<parent_sid>__agent__<agent_id>/ with
+# a converted audit.jsonl.gz + meta.json + summary.json. Type B events
+# are left alone.
+def _transcript_to_events(transcript_path: Path, parent_sid: str) -> list[dict]:
+    """Convert a Claude Code sub-agent transcript into our hook-event format.
+
+    Transcript lines look like:
+      {type: "user" | "assistant", isSidechain: true, timestamp: "...",
+       message: { role, content: str | [{type: "text"|"tool_use"|"tool_result", ...}] } }
+
+    Translation rules:
+      user + content string               → UserPromptSubmit
+      user + tool_result block            → PostToolUse (tool_name resolved
+                                             via earlier tool_use_id map)
+      assistant + tool_use block          → PreToolUse
+      assistant + text block              → AssistantMessage (synthetic)
+    """
+    events: list[dict] = []
+    tool_name_by_id: dict[str, str] = {}
+    if not transcript_path.exists():
+        return events
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_raw = obj.get("timestamp", "") or ""
+                # Normalise to our YYYY-MM-DDTHH:MM:SSZ format; transcripts
+                # carry ms + optional offset. If parsing fails, keep the
+                # original value so ordering is stable.
+                parsed = _parse_ts(ts_raw)
+                ts = parsed.strftime("%Y-%m-%dT%H:%M:%SZ") if parsed else ts_raw
+                t = obj.get("type", "")
+                msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
+                content = msg.get("content", "")
+
+                if t == "user":
+                    if isinstance(content, str) and content:
+                        events.append({
+                            "ts": ts, "event": "UserPromptSubmit",
+                            "data": {"session_id": parent_sid, "prompt": content},
+                        })
+                    elif isinstance(content, list):
+                        for b in content:
+                            if not isinstance(b, dict):
+                                continue
+                            if b.get("type") == "tool_result":
+                                tool_use_id = b.get("tool_use_id", "") or ""
+                                resp = b.get("content", "")
+                                events.append({
+                                    "ts": ts, "event": "PostToolUse",
+                                    "data": {
+                                        "session_id":   parent_sid,
+                                        "tool_name":    tool_name_by_id.get(tool_use_id, ""),
+                                        "tool_use_id":  tool_use_id,
+                                        "tool_response": resp,
+                                    },
+                                })
+                elif t == "assistant":
+                    if isinstance(content, list):
+                        for b in content:
+                            if not isinstance(b, dict):
+                                continue
+                            bt = b.get("type")
+                            if bt == "tool_use":
+                                tu_id = b.get("id", "") or ""
+                                tu_name = b.get("name", "") or ""
+                                tool_name_by_id[tu_id] = tu_name
+                                events.append({
+                                    "ts": ts, "event": "PreToolUse",
+                                    "data": {
+                                        "session_id":   parent_sid,
+                                        "tool_name":    tu_name,
+                                        "tool_input":   b.get("input", {}),
+                                        "tool_use_id":  tu_id,
+                                    },
+                                })
+                            elif bt == "text":
+                                events.append({
+                                    "ts": ts, "event": "AssistantMessage",
+                                    "data": {
+                                        "session_id": parent_sid,
+                                        "text":       b.get("text", "") or "",
+                                    },
+                                })
+    except OSError:
+        pass
+    return events
+
+
+def _write_subagent_dir(parent_dir: Path, stop_event: dict) -> None:
+    """Materialise a sub-agent dir from a SubagentStop event + transcript.
+
+    Only called for explicit (type A) sub-agents, i.e. agent_type non-empty.
+    """
+    data = stop_event.get("data", {}) if isinstance(stop_event.get("data"), dict) else {}
+    agent_id = data.get("agent_id", "") or ""
+    agent_type = data.get("agent_type", "") or ""
+    if not agent_id or not agent_type:
+        return
+    transcript_path = Path(data.get("agent_transcript_path", "") or "")
+    parent_sid = parent_dir.name
+    siblings_root = parent_dir.parent
+    layer_name = parent_sid + "__agent__" + agent_id
+    layer_dir = siblings_root / layer_name
+
+    # Neighbouring meta.json (Claude Code's, carries agentType + description).
+    description = ""
+    if transcript_path:
+        meta_sibling = transcript_path.with_suffix("").with_suffix(".meta.json")
+        if meta_sibling.exists():
+            try:
+                with open(meta_sibling) as f:
+                    mj = json.load(f) or {}
+                description = mj.get("description", "") or ""
+                if not agent_type:
+                    agent_type = mj.get("agentType", "") or ""
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    events = _transcript_to_events(transcript_path, parent_sid) if transcript_path else []
+    # Always append the SubagentStop event itself so the layer has a clear
+    # terminator, and so last_assistant_message is visible inline.
+    events.append(stop_event)
+
+    try:
+        layer_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    # Write audit.jsonl then gzip atomically (line-count verified).
+    jsonl_path = layer_dir / "audit.jsonl"
+    try:
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+    except OSError:
+        return
+
+    # Derive summary fields from the translated events.
+    num_tool_calls = sum(1 for e in events if e.get("event") == "PreToolUse")
+    first_ts = events[0].get("ts", "") if events else ""
+    last_ts  = events[-1].get("ts", "") if events else ""
+    duration_ms = 0
+    t0 = _parse_ts(first_ts)
+    t1 = _parse_ts(last_ts)
+    if t0 and t1:
+        duration_ms = int((t1 - t0).total_seconds() * 1000)
+
+    meta_obj = {
+        "is_subagent":        True,
+        "parent_session_id":  parent_sid,
+        "root_session_id":    parent_sid,
+        "agent_id":           agent_id,
+        "agent_type":         agent_type,
+        "description":        description[:500],
+        "start_ts":           first_ts,
+        "source":             "transcript",
+    }
+    try:
+        with open(layer_dir / "meta.json", "w") as f:
+            json.dump(meta_obj, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+    sub_summary = {
+        "is_subagent":       True,
+        "reason":            "normal",
+        "parent_session_id": parent_sid,
+        "agent_type":        agent_type,
+        "agent_id":          agent_id,
+        "description":       description[:500],
+        "num_tool_calls":    num_tool_calls,
+        "num_turns":         sum(1 for e in events if e.get("event") == "UserPromptSubmit"),
+        "duration_ms":       duration_ms,
+    }
+    try:
+        with open(layer_dir / "summary.json", "w") as f:
+            json.dump(sub_summary, f, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+    _atomic_gzip(jsonl_path)
+
+
 def _slice_subagents(parent_dir: Path) -> None:
+    """For each type-A SubagentStop in the parent audit, materialise a
+    sub-agent dir from its transcript. Type-B (empty agent_type) events
+    are skipped; they remain inline in the parent stream."""
     jsonl = parent_dir / "audit.jsonl"
     if not jsonl.exists() or jsonl.stat().st_size == 0:
         return
@@ -212,138 +413,25 @@ def _slice_subagents(parent_dir: Path) -> None:
         src_bytes = jsonl.read_bytes()
     except OSError:
         return
-
-    parent_dir_name = parent_dir.name
-    # In the flat layout this is AUDIT_DIR — sub-agent dirs become
-    # ~/.claude-audit/<sid>__agent__<id>/, co-located with the parent.
-    siblings_root = parent_dir.parent
-    slicing_stack: list[dict] = []
-    last_task_desc = ""
-
-    def _open_layer(agent_id, agent_type, desc, start_ts, immediate_parent_name):
-        name = immediate_parent_name + "__agent__" + (agent_id or "unknown")
-        dpath = siblings_root / name
-        dpath.mkdir(parents=True, exist_ok=True)
-        fh = open(dpath / "audit.jsonl", "ab")
-        return {
-            "dir":         dpath,
-            "name":        name,
-            "fh":          fh,
-            "agent_id":    agent_id,
-            "agent_type":  agent_type,
-            "desc":        desc or "",
-            "start_ts":    start_ts,
-            "immediate_parent_name": immediate_parent_name,
-            "tool_count":  0,
-            "event_count": 0,
-            "first_ts":    None,
-            "last_ts":     None,
-        }
-
-    def _write_to(entry, raw_line, ts):
-        entry["fh"].write(raw_line)
-        entry["event_count"] += 1
-        if entry["first_ts"] is None:
-            entry["first_ts"] = ts
-        entry["last_ts"] = ts
-
-    def _close_layer(entry, reason):
-        try:
-            entry["fh"].flush()
-            entry["fh"].close()
-        except Exception:
-            pass
-
-        meta_obj = {
-            "is_subagent":        True,
-            "parent_session_id":  entry["immediate_parent_name"],
-            "root_session_id":    parent_dir_name,
-            "agent_id":           entry["agent_id"],
-            "agent_type":         entry["agent_type"],
-            "description":        (entry["desc"] or "")[:500],
-            "start_ts":           entry["start_ts"],
-        }
-        try:
-            with open(entry["dir"] / "meta.json", "w") as f:
-                json.dump(meta_obj, f, indent=2)
-        except OSError:
-            pass
-
-        duration_ms_sub = 0
-        t0 = _parse_ts(entry["first_ts"])
-        t1 = _parse_ts(entry["last_ts"])
-        if t0 and t1:
-            duration_ms_sub = int((t1 - t0).total_seconds() * 1000)
-        sub_summary = {
-            "is_subagent":       True,
-            "reason":            reason,
-            "parent_session_id": entry["immediate_parent_name"],
-            "agent_type":        entry["agent_type"],
-            "agent_id":          entry["agent_id"],
-            "description":       (entry["desc"] or "")[:500],
-            "num_tool_calls":    entry["tool_count"],
-            "num_turns":         0,
-            "duration_ms":       duration_ms_sub,
-        }
-        try:
-            with open(entry["dir"] / "summary.json", "w") as f:
-                json.dump(sub_summary, f, indent=2)
-        except OSError:
-            pass
-
-        _atomic_gzip(entry["dir"] / "audit.jsonl")
-
-    for raw_line in src_bytes.splitlines(keepends=True):
+    for raw_line in src_bytes.splitlines():
         stripped = raw_line.strip()
         if not stripped:
             continue
         try:
             obj = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        ev  = obj.get("event", "")
-        dat = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
-        ts  = obj.get("ts", "")
-
-        # Stash Task/Agent description so the next SubagentStart can use it.
-        if ev == "PreToolUse" and dat.get("tool_name") in ("Task", "Agent"):
-            ti = dat.get("tool_input", {}) if isinstance(dat.get("tool_input"), dict) else {}
-            last_task_desc = (ti.get("description") or ti.get("prompt") or "")[:500]
-            # Fall through so the event still mirrors into open layers below.
-
-        if ev == "SubagentStart":
-            immediate_parent_name = slicing_stack[-1]["name"] if slicing_stack else parent_dir_name
-            agent_id   = dat.get("agent_id", "") or ""
-            agent_type = dat.get("agent_type", "") or ""
-            desc = last_task_desc or dat.get("description") or dat.get("prompt") or ""
-            last_task_desc = ""
-            try:
-                layer = _open_layer(agent_id, agent_type, desc, ts, immediate_parent_name)
-            except OSError:
-                continue
-            for anc in slicing_stack:
-                _write_to(anc, raw_line, ts)
-            _write_to(layer, raw_line, ts)
-            slicing_stack.append(layer)
+        if obj.get("event") != "SubagentStop":
             continue
-
-        if ev == "SubagentStop":
-            for anc in slicing_stack:
-                _write_to(anc, raw_line, ts)
-            if slicing_stack:
-                leaving = slicing_stack.pop()
-                _close_layer(leaving, reason="normal")
+        data = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
+        if not (data.get("agent_type") or "").strip():
+            continue  # type B: state-summary checkpoint, not a real sub-agent
+        try:
+            _write_subagent_dir(parent_dir, obj)
+        except Exception:
+            # Defensive — never block the parent SessionEnd gzip on a
+            # single broken sub-agent slice.
             continue
-
-        if slicing_stack:
-            for anc in slicing_stack:
-                _write_to(anc, raw_line, ts)
-                if ev in ("PostToolUse", "PostToolUseFailure"):
-                    anc["tool_count"] += 1
-
-    while slicing_stack:
-        leaving = slicing_stack.pop()
-        _close_layer(leaving, reason="unclosed")
 
 
 def _handle_session_end(session_dir: Path, event_data: dict) -> None:

@@ -169,49 +169,129 @@ def test_session_end_with_transcript_skips_synthetic():
         assert_eq("gz line count", gz_lines, 2)  # UserPromptSubmit + SessionEnd
 
 
-def test_subagent_slicing():
-    print("test_subagent_slicing")
+def test_subagent_slicing_from_transcript():
+    """Post-2026-04-16 reality: SubagentStart never fires; SubagentStop with
+    non-empty agent_type is the sole anchor. This test fires a synthetic
+    SubagentStop that points at a pre-written transcript + meta.json, and
+    verifies _slice_subagents materialises a sub-agent dir by translating
+    the transcript into our hook-event format.
+    """
+    print("test_subagent_slicing_from_transcript")
     with tempfile.TemporaryDirectory() as tmp:
         home = Path(tmp)
-        sid = "test-sid-003"
-        # Replay events: PreToolUse(Task) -> SubagentStart -> Pre/Post inside ->
-        # SubagentStop -> SessionEnd. The slice should produce a sub-agent dir.
-        events = [
-            ("PreToolUse", {"session_id": sid, "tool_name": "Task",
-                            "tool_input": {"description": "do work",
-                                           "subagent_type": "Explore",
-                                           "prompt": "x"}}),
-            ("SubagentStart", {"session_id": sid, "agent_id": "agt-1",
-                               "agent_type": "Explore"}),
-            ("PreToolUse", {"session_id": sid, "tool_name": "Bash"}),
-            ("PostToolUse", {"session_id": sid, "tool_name": "Bash"}),
-            ("SubagentStop", {"session_id": sid, "agent_id": "agt-1"}),
-        ]
-        for ev, payload in events:
-            rc = run_hook(ev, payload, {}, home)
-            assert_eq(f"rc {ev}", rc, 0)
+        sid = "test-sid-sa-transcript"
+        aid = "atestsubagent00001"
 
-        # SessionEnd with no transcript path — sub-agent slicing still runs.
+        # Build a Claude-Code-shaped transcript + meta sidecar.
+        transcript_dir = home / ".claude" / "projects" / "-x" / sid / "subagents"
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path = transcript_dir / f"agent-{aid}.jsonl"
+        meta_path       = transcript_dir / f"agent-{aid}.meta.json"
+        transcript_rows = [
+            {"type": "user", "isSidechain": True,
+             "timestamp": "2026-04-16T10:00:00.000Z",
+             "message": {"role": "user", "content": "find the file"}},
+            {"type": "assistant", "isSidechain": True,
+             "timestamp": "2026-04-16T10:00:01.500Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "text", "text": "I'll glob for it."},
+                 {"type": "tool_use", "id": "tu_abc",
+                  "name": "Glob", "input": {"pattern": "**/*.py"}},
+             ]}},
+            {"type": "user", "isSidechain": True,
+             "timestamp": "2026-04-16T10:00:02.000Z",
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "tu_abc",
+                  "content": "src/main.py"},
+             ]}},
+            {"type": "assistant", "isSidechain": True,
+             "timestamp": "2026-04-16T10:00:03.000Z",
+             "message": {"role": "assistant", "content": [
+                 {"type": "text", "text": "Found it at src/main.py."},
+             ]}},
+        ]
+        transcript_path.write_text("\n".join(json.dumps(r) for r in transcript_rows) + "\n")
+        meta_path.write_text(json.dumps({
+            "agentType":   "Explore",
+            "description": "Find the main entry point",
+        }))
+
+        # Feed a SubagentStop event that references this transcript.
+        rc = run_hook("SubagentStop", {
+            "session_id":            sid,
+            "agent_id":              aid,
+            "agent_type":            "Explore",
+            "agent_transcript_path": str(transcript_path),
+            "last_assistant_message": "Found it at src/main.py.",
+        }, {}, home)
+        assert_eq("rc SubagentStop", rc, 0)
+        # SessionEnd triggers slicing + gzip.
         rc = run_hook("SessionEnd",
                       {"session_id": sid, "transcript_path": "", "reason": "exit"},
                       {}, home)
         assert_eq("rc SessionEnd", rc, 0)
 
         d = today_dir(home, sid)
-        date_dir = d.parent
-        # Find the sub-agent dir: <sid>__agent__agt-1
-        sub = date_dir / f"{sid}__agent__agt-1"
+        siblings_root = d.parent
+        sub = siblings_root / f"{sid}__agent__{aid}"
         assert_ok("sub dir exists", sub.is_dir(), str(sub))
+
         meta = json.loads((sub / "meta.json").read_text())
-        assert_eq("meta.agent_id", meta["agent_id"], "agt-1")
+        assert_eq("meta.agent_id",         meta["agent_id"], aid)
+        assert_eq("meta.agent_type",       meta["agent_type"], "Explore")
+        assert_eq("meta.description",      meta["description"], "Find the main entry point")
         assert_eq("meta.parent_session_id", meta["parent_session_id"], sid)
-        assert_eq("meta.description", meta["description"], "do work")
-        sub_summary = json.loads((sub / "summary.json").read_text())
-        assert_eq("sub.is_subagent", sub_summary["is_subagent"], True)
-        assert_eq("sub.num_tool_calls", sub_summary["num_tool_calls"], 1)
-        # sub-agent jsonl must also be gzipped
-        assert_ok("sub plain gone", not (sub / "audit.jsonl").exists())
+        assert_eq("meta.source",           meta["source"], "transcript")
+
+        summary = json.loads((sub / "summary.json").read_text())
+        assert_eq("summary.num_tool_calls", summary["num_tool_calls"], 1)  # Glob
+        assert_eq("summary.num_turns",      summary["num_turns"], 1)       # user msg
+
+        # Audit events: translate gives UserPromptSubmit + AssistantMessage
+        # + PreToolUse(Glob) + PostToolUse(Glob) + AssistantMessage + SubagentStop
         assert_ok("sub gz exists", (sub / "audit.jsonl.gz").exists())
+        assert_ok("sub plain gone", not (sub / "audit.jsonl").exists())
+        with gzip.open(sub / "audit.jsonl.gz", "rt") as f:
+            sub_events = [json.loads(l) for l in f if l.strip()]
+        ev_names = [e["event"] for e in sub_events]
+        assert_ok("contains PreToolUse",     "PreToolUse" in ev_names, str(ev_names))
+        assert_ok("contains PostToolUse",    "PostToolUse" in ev_names, str(ev_names))
+        assert_ok("contains UserPromptSubmit","UserPromptSubmit" in ev_names, str(ev_names))
+        assert_ok("ends with SubagentStop",  ev_names[-1] == "SubagentStop", str(ev_names))
+        pre = [e for e in sub_events if e["event"] == "PreToolUse"][0]
+        assert_eq("pre.tool_name", pre["data"]["tool_name"], "Glob")
+        post = [e for e in sub_events if e["event"] == "PostToolUse"][0]
+        assert_eq("post.tool_name", post["data"]["tool_name"], "Glob")
+
+
+def test_checkpoint_subagent_stop_not_sliced():
+    """Type-B SubagentStop (empty agent_type, no transcript) must NOT
+    produce a sub-agent dir — it is a state-summary checkpoint and
+    belongs inline in the parent audit stream only.
+    """
+    print("test_checkpoint_subagent_stop_not_sliced")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        sid = "test-sid-checkpoint"
+        rc = run_hook("SubagentStop", {
+            "session_id":             sid,
+            "agent_id":               "astatesum00000001",
+            "agent_type":             "",    # ← type B marker
+            "agent_transcript_path":  "/nonexistent",
+            "last_assistant_message": "Goal: X. Current: Y. Next: Z.",
+        }, {}, home)
+        assert_eq("rc", rc, 0)
+        rc = run_hook("SessionEnd",
+                      {"session_id": sid, "transcript_path": "", "reason": "exit"},
+                      {}, home)
+        assert_eq("rc SessionEnd", rc, 0)
+
+        siblings_root = today_dir(home, sid).parent
+        agent_dirs = [p for p in siblings_root.iterdir()
+                      if p.is_dir() and "__agent__" in p.name]
+        assert_ok("no sub-agent dir created for type-B stop",
+                  agent_dirs == [],
+                  f"unexpected: {[p.name for p in agent_dirs]}")
 
 
 def test_single_session_multi_tool_capture():
@@ -287,7 +367,7 @@ def test_single_session_multi_tool_capture():
                   [ev for ev, _ in events] + ["SessionEnd"])
 
 
-def test_nested_subagent_slicing():
+def _DISABLED_test_nested_subagent_slicing():  # retained for reference; SubagentStart no longer fires
     """Two levels of nested sub-agents.
 
     Layout (events written to parent audit.jsonl in order):
@@ -515,9 +595,9 @@ def main():
         test_basic_append_and_env,
         test_failure_safe_on_bad_input,
         test_session_end_with_transcript_skips_synthetic,
-        test_subagent_slicing,
+        test_subagent_slicing_from_transcript,
+        test_checkpoint_subagent_stop_not_sliced,
         test_single_session_multi_tool_capture,
-        test_nested_subagent_slicing,
         test_resumed_session_merges_into_gz,
         test_flat_layout_no_date_dir,
     ]:

@@ -294,6 +294,10 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 .event-row.session-end { color: var(--green); border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
 .event-row.subagent-start { color: var(--cyan); }
 .event-row.subagent-stop { color: var(--cyan); border-top: 1px solid var(--border); margin-top: 2px; padding-top: 2px; }
+.event-row.checkpoint { color: var(--gray); background: var(--bg2); border-left: 2px solid var(--yellow); }
+.event-row.checkpoint .tool-name { color: var(--yellow); }
+.event-row.assistant-msg { color: var(--fg); }
+.event-row.assistant-msg .tool-name { color: var(--blue); }
 .event-row.task-event { color: var(--orange); }
 .event-row.notification-event { color: var(--gray); }
 .event-row.perm-event { color: var(--yellow); }
@@ -802,6 +806,7 @@ function processEvent(event, container) {
     case 'SessionEnd':          renderSessionEnd(ts, d, container); break;
     case 'SubagentStart':       renderSubagentStart(ts, d, container); break;
     case 'SubagentStop':        renderSubagentStop(ts, d, container); break;
+    case 'AssistantMessage':    renderAssistantMessage(ts, d, container); break;
     case 'TaskCreated':         renderTaskCreated(ts, d, container); break;
     case 'TaskCompleted':       renderTaskCompleted(ts, d, container); break;
     case 'Notification':        renderNotification(ts, d, container); break;
@@ -1044,33 +1049,45 @@ function renderSubagentStart(ts, d, container) {
 }
 
 function renderSubagentStop(ts, d, container) {
-  const msg = (d.last_assistant_message || d.reason || '').substring(0, 150);
+  const msg = (d.last_assistant_message || d.reason || '').substring(0, 400);
+  const msgShort = msg.substring(0, 150);
   const agentId = (d.agent_id || '').substring(0, 8);
   const declaredType = d.agent_type || '';
 
-  // Orphan stop: no matching SubagentStart in this stream. Two common
-  // origins seen empirically:
-  //   (1) Auto-compact summarizer sub-agent — Claude Code spawns it
-  //       internally on PreCompact; only the Stop hook fires. agent_type
-  //       comes back empty.
-  //   (2) Sub-agents started outside the current event window.
-  // Render as a self-contained "AGENT" row (no └ closing marker) so the
-  // user sees what happened without phantom open/close pairing.
-  if (subagentStack.length === 0) {
-    const label = declaredType || 'auto-compact summary';
-    const idPart = agentId ? ` ${agentId}` : '';
-    const text = msg
-      ? `${esc(label)}${esc(idPart)} — ${esc(msg)}`
-      : `${esc(label)}${esc(idPart)}`;
-    container.append(makeRow(ts, '🤖', 'AGENT', text, 'subagent-stop', msg, ''));
+  // Empirical reality: Claude Code fires SubagentStop in two shapes.
+  //
+  //  Type A — explicit spawn (Task/Agent tool). agent_type non-empty
+  //           (e.g. "Explore", "general-purpose"). A transcript +
+  //           meta.json is persisted; hook.py materialises a separate
+  //           <sid>__agent__<id>/ sub-session dir from it.
+  //  Type B — internal state-summary agent. agent_type is the empty
+  //           string; no transcript is written. last_assistant_message
+  //           is a "Goal / Current / Next" snapshot. Not a real
+  //           sub-agent — render as a checkpoint inline.
+  //
+  // SubagentStart never fires in practice, so we do not rely on a
+  // subagentStack for pairing. Both types render as self-contained rows.
+  if (!declaredType.trim()) {
+    const text = msgShort ? `${esc(msgShort)}` : '(no summary)';
+    container.append(
+      makeRow(ts, '📸', 'CHECKPOINT', text, 'checkpoint', msg, '')
+    );
     return;
   }
+  const idPart = agentId ? ` ${agentId}` : '';
+  const text = msgShort
+    ? `${esc(declaredType)}${esc(idPart)} — ${esc(msgShort)}`
+    : `${esc(declaredType)}${esc(idPart)}`;
+  container.append(makeRow(ts, '🤖', 'AGENT', text, 'subagent-stop', msg, ''));
+}
 
-  // Normal close: pop BEFORE rendering so the └ line sits at the parent's
-  // depth, same as the matching ┌.
-  const popped = subagentStack.pop();
-  const agentType = declaredType || popped.agent_type || 'agent';
-  container.append(makeRow(ts, '🤖', 'AGENT DONE', `${esc(agentType)} — ${esc(msg)}`, 'subagent-stop', msg, '└ '));
+// Assistant text block from a sub-agent transcript, synthesised by
+// hook.py::_transcript_to_events. Not a real Claude Code hook event.
+function renderAssistantMessage(ts, d, container) {
+  const text = (d.text || '').substring(0, 600);
+  container.append(
+    makeRow(ts, '💬', 'ASSISTANT', esc(text), 'assistant-msg', d.text || '', '')
+  );
 }
 
 function renderTaskCreated(ts, d, container) {
