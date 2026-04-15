@@ -1241,6 +1241,12 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 if fh is None and jsonl.exists():
                     try:
                         fh = open(jsonl, "r", encoding="utf-8", errors="replace")
+                        # SSE is a live tail, NOT a replay. The frontend
+                        # already fetched everything via /events before
+                        # opening this stream — replaying the existing
+                        # content would render every line twice. Seek to
+                        # end so we only emit appended events.
+                        fh.seek(0, 2)
                     except OSError:
                         fh = None
 
