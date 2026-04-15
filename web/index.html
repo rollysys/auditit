@@ -1044,10 +1044,32 @@ function renderSubagentStart(ts, d, container) {
 }
 
 function renderSubagentStop(ts, d, container) {
-  // Pop BEFORE rendering so the └ line sits at the parent's depth, same as ┌.
-  const agentType = d.agent_type || d.tool_name || 'agent';
-  if (subagentStack.length > 0) subagentStack.pop();
   const msg = (d.last_assistant_message || d.reason || '').substring(0, 150);
+  const agentId = (d.agent_id || '').substring(0, 8);
+  const declaredType = d.agent_type || '';
+
+  // Orphan stop: no matching SubagentStart in this stream. Two common
+  // origins seen empirically:
+  //   (1) Auto-compact summarizer sub-agent — Claude Code spawns it
+  //       internally on PreCompact; only the Stop hook fires. agent_type
+  //       comes back empty.
+  //   (2) Sub-agents started outside the current event window.
+  // Render as a self-contained "AGENT" row (no └ closing marker) so the
+  // user sees what happened without phantom open/close pairing.
+  if (subagentStack.length === 0) {
+    const label = declaredType || 'auto-compact summary';
+    const idPart = agentId ? ` ${agentId}` : '';
+    const text = msg
+      ? `${esc(label)}${esc(idPart)} — ${esc(msg)}`
+      : `${esc(label)}${esc(idPart)}`;
+    container.append(makeRow(ts, '🤖', 'AGENT', text, 'subagent-stop', msg, ''));
+    return;
+  }
+
+  // Normal close: pop BEFORE rendering so the └ line sits at the parent's
+  // depth, same as the matching ┌.
+  const popped = subagentStack.pop();
+  const agentType = declaredType || popped.agent_type || 'agent';
   container.append(makeRow(ts, '🤖', 'AGENT DONE', `${esc(agentType)} — ${esc(msg)}`, 'subagent-stop', msg, '└ '));
 }
 
