@@ -416,6 +416,73 @@ def test_nested_subagent_slicing():
         assert_eq("l2.num_tool_calls", l2_summary["num_tool_calls"], 1)
 
 
+def test_resumed_session_merges_into_gz():
+    """A session that SessionEnd'd then was resumed produces a (.gz + .jsonl)
+    pair until the next SessionEnd merges them. After that next SessionEnd
+    the cumulative history must be one .gz containing all events from
+    BOTH the original run and the resume.
+    """
+    print("test_resumed_session_merges_into_gz")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        sid = "test-sid-resume"
+
+        # First run: 2 events then SessionEnd → produces audit.jsonl.gz
+        for ev, payload in [
+            ("PreToolUse",  {"session_id": sid, "tool_name": "Read"}),
+            ("PostToolUse", {"session_id": sid, "tool_name": "Read"}),
+        ]:
+            assert_eq(f"rc {ev}", run_hook(ev, payload, {}, home), 0)
+        assert_eq("rc end1",
+                  run_hook("SessionEnd",
+                            {"session_id": sid, "transcript_path": "", "reason": "exit"},
+                            {}, home),
+                  0)
+        d = today_dir(home, sid)
+        assert_ok("after first SessionEnd: gz only",
+                  not (d / "audit.jsonl").exists() and (d / "audit.jsonl.gz").exists())
+        with gzip.open(d / "audit.jsonl.gz", "rt") as f:
+            first_run_lines = [l for l in f if l.strip()]
+        assert_eq("first-run gz lines", len(first_run_lines), 3)  # 2 events + SessionEnd
+
+        # Resume: same sid, more events. hook.py opens audit.jsonl in append
+        # so .gz coexists with a fresh .jsonl until next SessionEnd.
+        for ev, payload in [
+            ("PreToolUse",  {"session_id": sid, "tool_name": "Bash",
+                              "tool_input": {"command": "echo"}}),
+            ("PostToolUse", {"session_id": sid, "tool_name": "Bash"}),
+            ("PreToolUse",  {"session_id": sid, "tool_name": "Edit",
+                              "tool_input": {"file_path": "/x"}}),
+        ]:
+            assert_eq(f"rc resumed {ev}", run_hook(ev, payload, {}, home), 0)
+
+        assert_ok("during resume: both files coexist",
+                  (d / "audit.jsonl").exists() and (d / "audit.jsonl.gz").exists())
+        resumed_jsonl_lines = (d / "audit.jsonl").read_text().splitlines()
+        assert_eq("resume jsonl line count", len(resumed_jsonl_lines), 3)
+
+        # Second SessionEnd: must merge .gz + .jsonl into a single new .gz
+        assert_eq("rc end2",
+                  run_hook("SessionEnd",
+                            {"session_id": sid, "transcript_path": "", "reason": "exit"},
+                            {}, home),
+                  0)
+        assert_ok("after second SessionEnd: gz only again",
+                  not (d / "audit.jsonl").exists() and (d / "audit.jsonl.gz").exists())
+        with gzip.open(d / "audit.jsonl.gz", "rt") as f:
+            merged_lines = [l for l in f if l.strip()]
+        # 3 from first run (2 + SessionEnd) + 3 resume tool events + SessionEnd = 7
+        assert_eq("merged gz line count", len(merged_lines), 7)
+
+        # Order check: first-run events precede resume events
+        first_3_events = [json.loads(l)["event"] for l in merged_lines[:3]]
+        rest_events    = [json.loads(l)["event"] for l in merged_lines[3:]]
+        assert_eq("history preserved at front", first_3_events,
+                  ["PreToolUse", "PostToolUse", "SessionEnd"])
+        assert_eq("resume events appended", rest_events,
+                  ["PreToolUse", "PostToolUse", "PreToolUse", "SessionEnd"])
+
+
 def test_flat_layout_no_date_dir():
     """Hook writes directly under ~/.claude-audit/<sid>/ — there must be
     no YYYY-MM-DD intermediate dir. Regression guard for the flat-layout
@@ -451,6 +518,7 @@ def main():
         test_subagent_slicing,
         test_single_session_multi_tool_capture,
         test_nested_subagent_slicing,
+        test_resumed_session_merges_into_gz,
         test_flat_layout_no_date_dir,
     ]:
         try:

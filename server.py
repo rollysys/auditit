@@ -254,10 +254,15 @@ def _last_active_iso(session_dir: Path) -> str:
     """
     jsonl = session_dir / "audit.jsonl"
     gz    = session_dir / "audit.jsonl.gz"
-    if jsonl.exists():
+    # Resume case: both files coexist. Prefer .jsonl (newer events) but
+    # fall back to .gz if .jsonl is empty (resume just started, no event
+    # written yet). For a single-file session, this picks the only one.
+    if jsonl.exists() and jsonl.stat().st_size > 0:
         src = jsonl
     elif gz.exists():
         src = gz
+    elif jsonl.exists():
+        src = jsonl
     else:
         return ""
     try:
@@ -780,44 +785,54 @@ def _load_summary(session_dir: Path) -> dict:
 
 
 def _count_events(session_dir: Path) -> int:
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
-    if not path.exists():
-        return 0
+    """Sum events across all audit sources (handles resumed sessions)."""
     count = 0
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for _ in f:
-                count += 1
-    except Exception:
-        pass
+    for path in _audit_sources(session_dir):
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for _ in f:
+                    count += 1
+        except Exception:
+            continue
     return count
 
 
-def read_events(session_dir: Path) -> list:
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
-    if not path.exists():
-        return []
+def _audit_sources(session_dir: Path) -> list[Path]:
+    """Return the audit log files for a session in chronological order.
 
-    events = []
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line:
+    A "resumed" session has BOTH audit.jsonl.gz (history from a previous
+    SessionEnd) AND audit.jsonl (events since the resume). Always read
+    .gz first when present so the timeline reads start-to-now even after
+    one or more resumes. The next SessionEnd will merge them back into
+    a single .gz; until then we just concatenate at read time.
+    """
+    sources = []
+    gz = session_dir / "audit.jsonl.gz"
+    jsonl = session_dir / "audit.jsonl"
+    if gz.exists():
+        sources.append(gz)
+    if jsonl.exists():
+        sources.append(jsonl)
+    return sources
+
+
+def read_events(session_dir: Path) -> list:
+    events: list = []
+    for path in _audit_sources(session_dir):
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
                         events.append(json.loads(line))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
-    except Exception:
-        pass
+        except Exception:
+            continue
     return events
 
 

@@ -137,14 +137,36 @@ def _build_usage(raw_usage: dict) -> dict:
 def _atomic_gzip(jsonl_path: Path) -> bool:
     """Compress jsonl_path → jsonl_path + '.gz' using tmpfile + line-count
     verify + os.replace. On any failure leave the original untouched.
-    Returns True iff the original was successfully replaced.
+
+    Resume case: when the .gz already exists (a previous SessionEnd left
+    one behind, then the user resumed via `claude --resume <sid>`), we
+    decompress the existing .gz and prepend it to the current jsonl bytes
+    so the resulting .gz contains the full session history. Server-side
+    read code also tolerates the (.gz + .jsonl) pair until the next
+    SessionEnd merges them.
+
+    Returns True iff the .gz was successfully written.
     """
     if not jsonl_path.exists() or jsonl_path.stat().st_size == 0:
         return False
     gz = jsonl_path.with_suffix(jsonl_path.suffix + ".gz")
     gz_tmp = gz.with_suffix(gz.suffix + ".tmp")
     try:
-        src_bytes = jsonl_path.read_bytes()
+        new_bytes = jsonl_path.read_bytes()
+        if gz.exists():
+            # Resume merge: existing .gz already holds the older history.
+            try:
+                with gzip.open(gz, "rb") as f:
+                    old_bytes = f.read()
+            except OSError:
+                old_bytes = b""
+            # Ensure the boundary has a newline so a chunk written without
+            # a trailing newline does not glue two records together.
+            if old_bytes and not old_bytes.endswith(b"\n"):
+                old_bytes += b"\n"
+            src_bytes = old_bytes + new_bytes
+        else:
+            src_bytes = new_bytes
         src_lines = src_bytes.count(b"\n")
         with gzip.open(gz_tmp, "wb", compresslevel=6) as fout:
             fout.write(src_bytes)
