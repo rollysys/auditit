@@ -21,7 +21,7 @@ Usage:
     install.py status
     install.py doctor
 
-By default --hook is the `hook.sh` next to this script. Passing --hook lets
+By default --hook is the `hook.py` next to this script. Passing --hook lets
 you point at any other script (e.g. a vendored copy on a remote host).
 
 The authoritative hook-event list lives in docs/claude-code-hooks.md and is
@@ -226,12 +226,14 @@ def _strip_our_hooks(entry_list) -> list:
 
 
 def _hook_entry(event: str, hook_script: str) -> dict:
+    # python3 invocation — see hook.py. The legacy "bash hook.sh" form is
+    # still recognised on uninstall via MARKER, so an upgrade flows cleanly.
     return {
         "matcher": "",
         "hooks": [
             {
                 "type": "command",
-                "command": f"bash {hook_script} {event} {MARKER}",
+                "command": f"python3 {hook_script} {event} {MARKER}",
             }
         ],
     }
@@ -242,7 +244,7 @@ def _hook_entry(event: str, hook_script: str) -> dict:
 def _resolve_hook_path(cli_hook: str | None) -> Path:
     if cli_hook:
         return Path(cli_hook).expanduser().resolve()
-    return (Path(__file__).resolve().parent / "hook.sh").resolve()
+    return (Path(__file__).resolve().parent / "hook.py").resolve()
 
 
 def _preflight(hook_path: Path, *, require_hook: bool = True) -> list[str]:
@@ -280,10 +282,15 @@ def _preflight(hook_path: Path, *, require_hook: bool = True) -> list[str]:
 
     # 4. python3 is obviously present (we're running in it), skip.
 
-    # 5. bash is on PATH (the hook command is `bash <path> <event>`)
-    import shutil
-    if shutil.which("bash") is None:
-        issues.append("`bash` not found on PATH — the hook command will fail.")
+    # 5. Hook script must be syntactically valid Python — physically
+    # prevents the "bad hook breaks every Claude Code session" failure
+    # mode by refusing to install a broken script.
+    if require_hook and hook_path.exists() and hook_path.suffix == ".py":
+        import py_compile
+        try:
+            py_compile.compile(str(hook_path), doraise=True)
+        except py_compile.PyCompileError as e:
+            issues.append(f"hook script does not parse as Python: {e.msg.strip()}")
 
     return issues
 
@@ -333,7 +340,7 @@ def cmd_install(args: argparse.Namespace) -> int:
             _log(f"  add:     {', '.join(plan_add)}")
         if plan_replace:
             _log(f"  replace: {', '.join(plan_replace)}")
-        _log(f"  hook:    bash {hook_path} <Event> {MARKER}")
+        _log(f"  hook:    python3 {hook_path} <Event> {MARKER}")
         _log(f"  target:  {SETTINGS_PATH}")
 
         if args.dry_run:
@@ -466,7 +473,7 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_i = sub.add_parser("install", help="Install auditit hook into ~/.claude/settings.json")
-    p_i.add_argument("--hook", help="Path to hook.sh (default: hook.sh next to install.py)")
+    p_i.add_argument("--hook", help="Path to hook script (default: hook.py next to install.py)")
     p_i.add_argument("--dry-run", action="store_true", help="Show plan without writing")
     p_i.add_argument("--force", action="store_true", help="Ignore pre-flight failures")
     p_i.set_defaults(func=cmd_install)
@@ -479,7 +486,7 @@ def main() -> int:
     p_s.set_defaults(func=cmd_status)
 
     p_d = sub.add_parser("doctor", help="Run pre-flight checks only")
-    p_d.add_argument("--hook", help="Path to hook.sh to validate")
+    p_d.add_argument("--hook", help="Path to hook script to validate")
     p_d.set_defaults(func=cmd_doctor)
 
     args = p.parse_args()
