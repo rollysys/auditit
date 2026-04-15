@@ -60,8 +60,14 @@ def discover(audit_dir: Path) -> dict[str, list[Path]]:
 
 
 def read_events_sorted(jsonls: list[Path]) -> list[bytes]:
-    """Read all event lines from given audit.jsonl(.gz) paths, sorted by ts."""
+    """Read all event lines from given audit.jsonl(.gz) paths, sorted by ts.
+
+    Dedupes by (ts, event, data) so re-running the migration over already-
+    consolidated data is idempotent. Without dedup, "merge sources + dst"
+    on a second run would double every event.
+    """
     rows: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
     for path in jsonls:
         if not path.exists():
             continue
@@ -80,6 +86,18 @@ def read_events_sorted(jsonls: list[Path]) -> list[bytes]:
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         rows.append(("", line))
                         continue
+                    # Dedupe key — canonical JSON of the relevant fields.
+                    try:
+                        key = json.dumps(
+                            (obj.get("ts", ""), obj.get("event", ""), obj.get("data", {})),
+                            sort_keys=True, ensure_ascii=False,
+                        )
+                    except (TypeError, ValueError):
+                        key = ""
+                    if key and key in seen:
+                        continue
+                    if key:
+                        seen.add(key)
                     rows.append((obj.get("ts", "") or "", line))
         except OSError:
             continue
@@ -228,17 +246,96 @@ def consolidate_one(sid: str, srcs: list[Path], audit_dir: Path, dry_run: bool) 
     return (sid, " · ".join(actions) if actions else "nothing to do")
 
 
+def dedupe_flat(audit_dir: Path, dry_run: bool) -> int:
+    """Walk every flat session dir and dedupe its audit.jsonl(.gz).
+
+    Repairs the side effect of running the migration twice in succession:
+    an earlier bug re-included the destination's content as a "source"
+    on subsequent runs, so every event was appended a second time.
+    Idempotent — re-running on already-clean data is a no-op.
+    """
+    fixed = 0
+    scanned = 0
+    for sd in sorted(audit_dir.iterdir()):
+        if not sd.is_dir():
+            continue
+        name = sd.name
+        if name.startswith("_") or name.startswith("."):
+            continue
+        if is_date_dir(name):
+            continue  # date-partitioned dir handled by main migration path
+        sources: list[Path] = []
+        for fn in ("audit.jsonl.gz", "audit.jsonl"):
+            p = sd / fn
+            if p.exists():
+                sources.append(p)
+        if not sources:
+            continue
+        scanned += 1
+        # Count before
+        original_total = 0
+        for p in sources:
+            opener = gzip.open if p.name.endswith(".gz") else open
+            try:
+                with opener(p, "rb") as f:
+                    original_total += sum(1 for L in f if L.strip())
+            except OSError:
+                pass
+        deduped_lines = read_events_sorted(sources)
+        if len(deduped_lines) == original_total:
+            continue  # no duplicates, nothing to do
+        fixed += 1
+        delta = original_total - len(deduped_lines)
+        print(f"  {name[:8]}…  {original_total} → {len(deduped_lines)}  (-{delta} dup)")
+        if dry_run:
+            continue
+        body = b"".join(deduped_lines)
+        # Always rewrite to the same shape as currently exists. If both
+        # exist we collapse into the .gz (the .jsonl came from a resume
+        # AFTER the duplicate poisoning, but its events are already in
+        # the deduped stream, so we can drop the plain file).
+        any_gz = any(p.name.endswith(".gz") for p in sources)
+        target_gz = sd / "audit.jsonl.gz"
+        target_jl = sd / "audit.jsonl"
+        if any_gz:
+            tmp = sd / "audit.jsonl.gz.tmp"
+            try:
+                with gzip.open(tmp, "wb", compresslevel=6) as f:
+                    f.write(body)
+                os.replace(tmp, target_gz)
+                if target_jl.exists():
+                    target_jl.unlink()
+            except Exception as e:
+                print(f"    FAIL writing gz: {e}")
+                try: tmp.unlink()
+                except OSError: pass
+        else:
+            write_atomic(target_jl, body)
+
+    print()
+    print(f"  scanned {scanned} session dir(s); rewrote {fixed} with dedup")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Flatten ~/.claude-audit/ layout (date-partitioned → flat)")
     ap.add_argument("--audit-dir", default=str(Path.home() / ".claude-audit"),
                     help="Audit dir (default: ~/.claude-audit)")
     ap.add_argument("--dry-run", action="store_true", help="Show plan without writing")
+    ap.add_argument("--dedupe-flat", action="store_true",
+                    help="Walk existing flat dirs and dedupe their audit logs (no migration)")
     args = ap.parse_args()
 
     audit_dir = Path(args.audit_dir).expanduser().resolve()
     if not audit_dir.is_dir():
         print(f"audit dir does not exist: {audit_dir}", file=sys.stderr)
         return 2
+
+    if args.dedupe_flat:
+        print(f"dedupe-flat: scanning flat session dirs under {audit_dir}")
+        if args.dry_run:
+            print("(dry-run — no files will be written)")
+        return dedupe_flat(audit_dir, args.dry_run)
 
     by_sid = discover(audit_dir)
     if not by_sid:
