@@ -4,10 +4,14 @@ server.py — Web backend for the auditit session viewer.
 
 Serves:
   GET /              → Web UI (index.html)
-  GET /api/sessions  → List all sessions (grouped by date)
-  GET /api/sessions/<date>/<session-id>/events → All events (JSONL or gz)
-  GET /api/sessions/<date>/<session-id>/stream → SSE stream (live tail)
-  GET /api/sessions/<date>/<session-id>/meta   → metadata + summary
+  GET /api/sessions  → List all sessions
+  GET /api/sessions/<session-id>/events → All events (JSONL or gz)
+  GET /api/sessions/<session-id>/stream → SSE stream (live tail)
+  GET /api/sessions/<session-id>/meta   → metadata + summary
+
+Layout: ~/.claude-audit/<session-id>/audit.jsonl(.gz) — flat, no date
+partitioning. Sub-agent dirs live as siblings: <session-id>__agent__<id>/.
+The frontend groups/sorts by started_at and last_active_at as needed.
 
 Cost is computed at serve time from summary.json's raw `usage` dict and
 `model` name, against the PRICING table below. Keep docs/claude-pricing.md
@@ -236,150 +240,316 @@ def _load_subagent_meta(session_dir: Path) -> dict | None:
     return m
 
 
-def list_sessions() -> dict:
-    """Return {date: [session_entry, ...]}.
+def _last_active_iso(session_dir: Path) -> str:
+    """ISO-8601 UTC of the LAST EVENT in the session's audit log.
 
-    Each entry carries is_subagent / parent_session_id / depth fields so
-    the web UI can render sub-agents indented under their parent.
+    Reads the last line of audit.jsonl (or .gz) and parses its `ts`. This
+    is the truth: file mtimes can be bumped by migrations, cp, tar, or any
+    write — but every event line carries its own timestamp.
 
-    Top-level parent sessions do not contain `__agent__` in their dir
-    name; sub-agent directories are named
-    `<immediate_parent>__agent__<agent_id>` (recursive, so a
-    sub-sub-agent is `<p>__agent__<c>__agent__<gc>`).
+    Cached into metadata.json keyed by the audit file's current size so we
+    only re-read when the file actually grew. For finished sessions (.gz)
+    the cache is permanent because the file size never changes again.
+    Returns "" when the session has no readable events.
     """
-    result = {}
+    jsonl = session_dir / "audit.jsonl"
+    gz    = session_dir / "audit.jsonl.gz"
+    # Resume case: both files coexist. Prefer .jsonl (newer events) but
+    # fall back to .gz if .jsonl is empty (resume just started, no event
+    # written yet). For a single-file session, this picks the only one.
+    if jsonl.exists() and jsonl.stat().st_size > 0:
+        src = jsonl
+    elif gz.exists():
+        src = gz
+    elif jsonl.exists():
+        src = jsonl
+    else:
+        return ""
+    try:
+        size = src.stat().st_size
+    except OSError:
+        return ""
+
+    # Cache lookup
+    meta_path = session_dir / "metadata.json"
+    cached = None
+    if meta_path.exists():
+        try:
+            with open(meta_path) as f:
+                cached = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            cached = None
+    if cached and cached.get("_last_active_src") == src.name \
+            and cached.get("_last_active_size") == size \
+            and cached.get("last_active_at"):
+        return cached["last_active_at"]
+
+    # Recompute: pull the LAST non-empty line from the audit log.
+    last_line = b""
+    try:
+        if src.name.endswith(".gz"):
+            with gzip.open(src, "rb") as f:
+                for line in f:
+                    if line.strip():
+                        last_line = line
+        else:
+            # Tail read — seek backward in 8KB chunks until we have at least
+            # one full newline-terminated line. Avoids decompressing or
+            # walking very long files.
+            with open(src, "rb") as f:
+                f.seek(0, 2)
+                end = f.tell()
+                if not end:
+                    return ""
+                chunk = 8192
+                tail = b""
+                pos = end
+                while pos > 0 and tail.count(b"\n") < 2:
+                    pos = max(0, pos - chunk)
+                    f.seek(pos)
+                    tail = f.read(end - pos)
+                # Last non-empty line of tail
+                for line in reversed(tail.splitlines()):
+                    if line.strip():
+                        last_line = line
+                        break
+    except OSError:
+        return ""
+
+    if not last_line:
+        return ""
+    try:
+        obj = json.loads(last_line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    ts = obj.get("ts", "") or ""
+
+    # Write through the cache (best-effort; never raise).
+    if ts and meta_path.parent.exists():
+        try:
+            new_meta = dict(cached) if isinstance(cached, dict) else {}
+            new_meta["last_active_at"]    = ts
+            new_meta["_last_active_src"]  = src.name
+            new_meta["_last_active_size"] = size
+            tmp = meta_path.with_name(meta_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(new_meta, f, indent=2)
+            os.replace(tmp, meta_path)
+        except OSError:
+            pass
+    return ts
+
+
+def list_sessions() -> dict:
+    """Return {sessions: [...], by_root: {...}} for the Web UI.
+
+    Each session entry carries is_subagent / parent_session_id / depth
+    so the UI can nest sub-agents under their parent.
+
+    Layout (post-flatten): ~/.claude-audit/<sid>/ for parents,
+    ~/.claude-audit/<sid>__agent__<id>/ for sub-agents (siblings, not
+    nested). Sorting/grouping by date is the frontend's job — we just
+    expose started_at and last_active_at.
+    """
+    sessions: list[dict] = []
     if not AUDIT_DIR.exists():
-        return result
+        return {"sessions": sessions}
 
-    for date_dir in sorted(AUDIT_DIR.iterdir(), reverse=True):
-        if not date_dir.is_dir() or not date_dir.name.startswith("20"):
+    # First pass: collect non-subagent (parent) dirs so we can resolve
+    # cwd inheritance for sub-agents.
+    parent_meta_cache: dict[str, dict] = {}
+
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
             continue
-        date_sessions = []
-        for session_dir in sorted(date_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            sid = session_dir.name
-            summary = _load_summary(session_dir)
-            count = _count_events(session_dir)
-            status = "active" if _is_session_active(session_dir) else "completed"
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        # Old date-partitioned dirs still on disk during transition look
+        # like "20YY-MM-DD". Skip them — the migration script handles them.
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        if SUBAGENT_SEP in sid:
+            continue  # collected in the second pass below
+        meta = _load_meta(session_dir, sid)
+        parent_meta_cache[sid] = meta
 
-            sub_meta = _load_subagent_meta(session_dir)
-            is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
+            continue
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        summary = _load_summary(session_dir)
+        count   = _count_events(session_dir)
+        status  = "active" if _is_session_active(session_dir) else "completed"
+        last_active = _last_active_iso(session_dir)
 
-            if is_subagent:
-                # Sub-agent entry. The "immediate parent" is the dir name
-                # preceding the last __agent__ token (so a grandchild's
-                # parent is the child dir, not the root session).
-                parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
-                agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
-                agent_type = (sub_meta or {}).get("agent_type", "")
-                description = (sub_meta or {}).get("description", "")
-                start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
-                depth      = sid.count(SUBAGENT_SEP)
-                # Try to inherit cwd from the root parent for display.
-                root_name = sid.split(SUBAGENT_SEP, 1)[0]
-                root_meta = _load_meta(date_dir / root_name, root_name) if (date_dir / root_name).is_dir() else {}
-                date_sessions.append({
-                    "id": sid,
-                    "date": date_dir.name,
-                    "prompt": description,
-                    "model": "",       # sub-agents share parent's model; leave blank
-                    "cwd": root_meta.get("cwd", ""),
-                    "count": count,
-                    "turns": summary.get("num_tool_calls", 0),
-                    # Sub-agent cost is not independently computable (usage
-                    # lives in the parent's transcript). Return None so the
-                    # UI shows "—" instead of $0.0000.
-                    "cost": None,
-                    "duration_ms": summary.get("duration_ms", 0),
-                    "status": status,
-                    "started_at": start_ts,
-                    "is_subagent": True,
-                    "parent_session_id": parent_name,
-                    "root_session_id": root_name,
-                    "agent_id": agent_id,
-                    "agent_type": agent_type,
-                    "depth": depth,
-                    # reason="unclosed" means hook.sh never saw a matching
-                    # SubagentStop for this layer — Claude Code sometimes
-                    # skips it. UI flags these with a ⚠ so they stand out.
-                    "reason": summary.get("reason", ""),
-                })
-            else:
-                meta = _load_meta(session_dir, sid)
-                model = summary.get("model", "") or meta.get("model", "")
-                cost = compute_cost(model, summary.get("usage", {}))
-                date_sessions.append({
-                    "id": sid,
-                    "date": date_dir.name,
-                    "prompt": meta.get("prompt", ""),
-                    "model": model,
-                    "cwd": meta.get("cwd", ""),
-                    "count": count,
-                    "turns": summary.get("num_turns", 0),
-                    "cost": cost,
-                    "duration_ms": summary.get("duration_ms", 0),
-                    "status": status,
-                    "started_at": meta.get("started_at", ""),
-                    "is_subagent": False,
-                    "parent_session_id": "",
-                    "root_session_id": sid,
-                    "depth": 0,
-                })
-        if date_sessions:
-            result[date_dir.name] = date_sessions
-    return result
+        sub_meta = _load_subagent_meta(session_dir)
+        is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
+        env = _load_env(session_dir)
+
+        if is_subagent:
+            parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
+            agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
+            agent_type = (sub_meta or {}).get("agent_type", "")
+            description = (sub_meta or {}).get("description", "")
+            start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
+            depth      = sid.count(SUBAGENT_SEP)
+            root_name = sid.split(SUBAGENT_SEP, 1)[0]
+            root_meta = parent_meta_cache.get(root_name, {})
+            root_env  = _load_env(AUDIT_DIR / root_name) if (AUDIT_DIR / root_name).is_dir() else {}
+            sessions.append({
+                "id": sid,
+                "prompt": description,
+                "model": "",
+                "cwd": root_meta.get("cwd", ""),
+                "count": count,
+                "turns": summary.get("num_tool_calls", 0),
+                "cost": None,
+                "duration_ms": summary.get("duration_ms", 0),
+                "status": status,
+                "started_at": start_ts,
+                "last_active_at": last_active,
+                "is_subagent": True,
+                "parent_session_id": parent_name,
+                "root_session_id": root_name,
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "depth": depth,
+                "reason": summary.get("reason", ""),
+                # Inherit mode from root session — a sub-agent of a
+                # scripted run is itself scripted for filtering purposes.
+                "mode": detect_mode(root_env or env),
+            })
+        else:
+            meta = parent_meta_cache.get(sid, {})
+            model = summary.get("model", "") or meta.get("model", "")
+            cost = compute_cost(model, summary.get("usage", {}))
+            sessions.append({
+                "id": sid,
+                "prompt": meta.get("prompt", ""),
+                "model": model,
+                "cwd": meta.get("cwd", ""),
+                "count": count,
+                "turns": summary.get("num_turns", 0),
+                "cost": cost,
+                "duration_ms": summary.get("duration_ms", 0),
+                "status": status,
+                "started_at": meta.get("started_at", ""),
+                "last_active_at": last_active,
+                "is_subagent": False,
+                "parent_session_id": "",
+                "root_session_id": sid,
+                "depth": 0,
+                "mode": detect_mode(env),
+            })
+
+    return {"sessions": sessions}
 
 
 def _load_meta(session_dir: Path, sid: str) -> dict:
+    """Return metadata.json if parseable, otherwise extract from events.
+
+    metadata.json may exist but only contain the last_active_at cache
+    without the SessionStart fields (if _last_active_iso ran before
+    anyone else populated the file). In that case we still need to
+    extract from events to recover prompt/model/cwd.
+
+    Concurrent-write tolerance: the file can be rewritten under us by
+    either _last_active_iso (atomic via os.replace) or the older
+    non-atomic path in _extract_meta_from_events. Any parse failure
+    falls through to the event-based extractor.
+    """
     meta_path = session_dir / "metadata.json"
     if meta_path.exists():
-        with open(meta_path) as f:
-            return json.load(f)
-    # Fallback: extract from first event
+        try:
+            with open(meta_path) as f:
+                cached = json.load(f)
+            # Only trust the cache if it carries the real metadata,
+            # not just the last_active_at helper fields.
+            if isinstance(cached, dict) and (
+                cached.get("model") or cached.get("prompt") or cached.get("cwd")
+            ):
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Fallback: extract from events (also covers the "only last_active"
+    # shell case created by _last_active_iso on a session that has not
+    # yet had its real metadata extracted).
     return _extract_meta_from_events(session_dir, sid)
 
 
 def _extract_meta_from_events(session_dir: Path, sid: str) -> dict:
-    meta = {"prompt": "", "model": "", "cwd": ""}
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
+    """Walk the audit log(s) for the SessionStart + first UserPromptSubmit.
 
-    if not path.exists():
+    For resumed sessions we must read BOTH the .gz (original SessionStart
+    lives there) and the .jsonl (resume delta). Reading only one would
+    miss either the start event or any newer prompt.
+    """
+    meta = {"prompt": "", "model": "", "cwd": "", "started_at": ""}
+
+    # _audit_sources returns gz first then jsonl, chronological for our
+    # purposes — which is what we want here (earliest SessionStart wins).
+    sources = _audit_sources(session_dir)
+    if not sources:
         return meta
 
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                    d = obj.get("data", {})
+    for path in sources:
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    d = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
                     if obj.get("event") == "SessionStart":
-                        meta["model"] = d.get("model", "")
-                        meta["cwd"] = d.get("cwd", "")
-                        meta["started_at"] = obj.get("ts", "")
+                        if not meta["model"]:
+                            meta["model"] = d.get("model", "") or ""
+                        if not meta["cwd"]:
+                            meta["cwd"] = d.get("cwd", "") or ""
+                        if not meta["started_at"]:
+                            meta["started_at"] = obj.get("ts", "") or ""
                     elif obj.get("event") == "UserPromptSubmit":
-                        prompt = d.get("prompt", "")[:200]
+                        prompt = (d.get("prompt", "") or "")[:200]
                         if prompt and not meta["prompt"]:
                             meta["prompt"] = prompt
                     if meta["model"] and meta["prompt"]:
                         break
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-    except Exception:
-        pass
-
-    # Persist metadata so we don't re-parse next time
-    if meta.get("model") or meta.get("prompt"):
-        try:
-            with open(session_dir / "metadata.json", "w") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            continue
+        if meta["model"] and meta["prompt"]:
+            break
 
+    # Persist so we don't re-parse next time. Merge with any cache that
+    # _last_active_iso already dropped in — preserve its fields.
+    if meta.get("model") or meta.get("prompt"):
+        meta_path = session_dir / "metadata.json"
+        merged = {}
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    merged = dict(existing)
+            except (OSError, json.JSONDecodeError):
+                pass
+        for k, v in meta.items():
+            if v and not merged.get(k):
+                merged[k] = v
+        # Atomic write — protects concurrent readers from mid-write tearing.
+        try:
+            tmp = meta_path.with_name(meta_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, meta_path)
+        except OSError:
+            pass
+        return merged
     return meta
 
 
@@ -439,6 +609,20 @@ def _load_env(session_dir: Path) -> dict:
         return {}
 
 
+def detect_mode(env: dict | None = None) -> str:
+    """Return "scripted" or "interactive" based on env.json flags.
+
+    Scripted = the parent Claude process was invoked with `-p` / `--print`
+    (headless). Interactive = anything else. Historical sessions without
+    env.json default to "interactive" (most common, and we do not want to
+    hide them retroactively).
+    """
+    env = env or {}
+    if env.get("is_headless") is True:
+        return "scripted"
+    return "interactive"
+
+
 def detect_provider(model: str, env: dict | None = None) -> str:
     """Infer the API provider, preferring env-based signals over model name.
 
@@ -485,12 +669,16 @@ def detect_provider(model: str, env: dict | None = None) -> str:
     return "other"
 
 
-def build_stats() -> dict:
+def build_stats(exclude_scripted: bool = False) -> dict:
     """Aggregate across all main sessions for the Dashboard view.
 
     Sub-agent directories are skipped — their token/cost usage is already
     captured in the parent session's transcript, so counting them would
     double-count.
+
+    When `exclude_scripted=True`, sessions whose env.json marks them as
+    headless (claude -p invocation) are omitted from every aggregate.
+    The frontend passes this flag when its scripted-filter toggle is off.
 
     Returns:
       totals: totals across all sessions (session count, cost, tokens,
@@ -501,125 +689,207 @@ def build_stats() -> dict:
       top_by_cost: top 20 sessions by cost.
       top_by_ctx: top 20 sessions by ctx_peak_pct.
     """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now_utc = _dt.now(_tz.utc)
+
+    def _parse_ts(s):
+        if not isinstance(s, str):
+            return None
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
     totals = {
         "sessions": 0, "cost": 0.0,
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "duration_ms": 0, "turns": 0,
+        # Rolling windows, populated below as we iterate.
+        "last_1h_cost":  0.0,
+        "last_24h_cost": 0.0,
+        "last_7d_cost":  0.0,
     }
     by_model: dict[str, dict] = {}
     by_provider: dict[str, dict] = {}
     by_date: dict[str, dict] = {}
+    by_hour: dict[str, dict] = {}    # "YYYY-MM-DDTHH:00Z" → agg
+    by_week: dict[str, dict] = {}    # ISO week key "YYYY-Www" → agg
     all_sessions: list[dict] = []
 
     if not AUDIT_DIR.exists():
-        return {"totals": totals, "by_model": [], "by_provider": [], "by_date": [],
-                "top_by_cost": [], "top_by_ctx": []}
+        return {"totals": totals, "by_model": [], "by_provider": [],
+                "by_date": [], "by_hour": [], "by_week": [],
+                "top_by_cost": [], "top_by_ctx": [], "top_cost_windows": []}
 
-    for date_dir in sorted(AUDIT_DIR.iterdir()):
-        if not date_dir.is_dir() or not date_dir.name.startswith("20"):
+    for session_dir in sorted(AUDIT_DIR.iterdir()):
+        if not session_dir.is_dir():
             continue
-        for session_dir in sorted(date_dir.iterdir()):
-            if not session_dir.is_dir():
-                continue
-            sid = session_dir.name
-            # Skip sub-agent directories — their usage is already in the parent.
-            if SUBAGENT_SEP in sid:
-                continue
-            summary = _load_summary(session_dir)
-            if not summary:
-                continue
+        sid = session_dir.name
+        if sid.startswith("_") or sid.startswith("."):
+            continue
+        # Old date-partitioned dirs left over during transition — skip.
+        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
+            continue
+        # Sub-agent directories — their usage lives in the parent's transcript.
+        if SUBAGENT_SEP in sid:
+            continue
+        summary = _load_summary(session_dir)
+        if not summary:
+            continue
 
-            usage = summary.get("usage", {}) or {}
-            inp = int(usage.get("input_tokens", 0) or 0)
-            out = int(usage.get("output_tokens", 0) or 0)
-            cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
-            cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
-            if not cw:
-                cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
-                      + int(usage.get("cache_creation_1h_tokens", 0) or 0))
+        usage = summary.get("usage", {}) or {}
+        inp = int(usage.get("input_tokens", 0) or 0)
+        out = int(usage.get("output_tokens", 0) or 0)
+        cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
+        cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        if not cw:
+            cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
+                  + int(usage.get("cache_creation_1h_tokens", 0) or 0))
 
-            meta = _load_meta(session_dir, sid)
-            env  = _load_env(session_dir)
-            model = summary.get("model", "") or meta.get("model", "") or "unknown"
-            provider = detect_provider(model, env)
-            cost = compute_cost(model, usage)
-            dur  = int(summary.get("duration_ms", 0) or 0)
-            turns = int(summary.get("num_turns", 0) or 0)
-            # calls/hr normalised from turns over duration. Clamp tiny durations
-            # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
-            calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
-            ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
+        meta = _load_meta(session_dir, sid)
+        env  = _load_env(session_dir)
+        if exclude_scripted and detect_mode(env) == "scripted":
+            continue
+        model = summary.get("model", "") or meta.get("model", "") or "unknown"
+        provider = detect_provider(model, env)
+        cost = compute_cost(model, usage)
+        dur  = int(summary.get("duration_ms", 0) or 0)
+        turns = int(summary.get("num_turns", 0) or 0)
+        # calls/hr normalised from turns over duration. Clamp tiny durations
+        # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
+        calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
+        ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
 
-            totals["sessions"] += 1
-            totals["cost"] += cost
-            totals["input_tokens"] += inp
-            totals["output_tokens"] += out
-            totals["cache_read_tokens"] += cr
-            totals["cache_creation_tokens"] += cw
-            totals["duration_ms"] += dur
-            totals["turns"] += turns
+        # Bucket the session into a date. With the flat layout this comes
+        # from started_at (or last_active_at as a fallback) — there is no
+        # date in the path. Keep the YYYY-MM-DD slice for the trend chart.
+        date_bucket = (meta.get("started_at", "") or _last_active_iso(session_dir))[:10]
+        if not date_bucket:
+            date_bucket = "unknown"
 
-            bm = by_model.setdefault(model, {
-                "model": model, "provider": provider, "sessions": 0, "cost": 0.0,
+        totals["sessions"] += 1
+        totals["cost"] += cost
+        totals["input_tokens"] += inp
+        totals["output_tokens"] += out
+        totals["cache_read_tokens"] += cr
+        totals["cache_creation_tokens"] += cw
+        totals["duration_ms"] += dur
+        totals["turns"] += turns
+
+        bm = by_model.setdefault(model, {
+            "model": model, "provider": provider, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bm["sessions"] += 1
+        bm["cost"] += cost
+        bm["input_tokens"] += inp
+        bm["output_tokens"] += out
+        bm["cache_read_tokens"] += cr
+        bm["cache_creation_tokens"] += cw
+        bm["turns"] += turns
+        bm["duration_ms"] += dur
+
+        bp = by_provider.setdefault(provider, {
+            "provider": provider, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bp["sessions"] += 1
+        bp["cost"] += cost
+        bp["input_tokens"] += inp
+        bp["output_tokens"] += out
+        bp["cache_read_tokens"] += cr
+        bp["cache_creation_tokens"] += cw
+        bp["turns"] += turns
+        bp["duration_ms"] += dur
+
+        bd = by_date.setdefault(date_bucket, {
+            "date": date_bucket, "sessions": 0, "cost": 0.0,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "turns": 0, "duration_ms": 0,
+        })
+        bd["sessions"] += 1
+        bd["cost"] += cost
+        bd["input_tokens"] += inp
+        bd["output_tokens"] += out
+        bd["cache_read_tokens"] += cr
+        bd["cache_creation_tokens"] += cw
+        bd["turns"] += turns
+        bd["duration_ms"] += dur
+
+        # Hour- and week-level buckets. We attribute the WHOLE session's
+        # cost to the hour/week it started — we do not have per-event
+        # cost data to split across hours for long-running sessions, so
+        # this is a documented approximation (same as by_date).
+        started_at = meta.get("started_at", "") or _last_active_iso(session_dir)
+        bucket_dt = _parse_ts(started_at)
+        if bucket_dt is not None:
+            hour_key = bucket_dt.strftime("%Y-%m-%dT%H:00Z")
+            bh = by_hour.setdefault(hour_key, {
+                "hour": hour_key, "sessions": 0, "cost": 0.0,
                 "input_tokens": 0, "output_tokens": 0,
                 "cache_read_tokens": 0, "cache_creation_tokens": 0,
                 "turns": 0, "duration_ms": 0,
             })
-            bm["sessions"] += 1
-            bm["cost"] += cost
-            bm["input_tokens"] += inp
-            bm["output_tokens"] += out
-            bm["cache_read_tokens"] += cr
-            bm["cache_creation_tokens"] += cw
-            bm["turns"] += turns
-            bm["duration_ms"] += dur
+            bh["sessions"] += 1
+            bh["cost"] += cost
+            bh["input_tokens"] += inp
+            bh["output_tokens"] += out
+            bh["cache_read_tokens"] += cr
+            bh["cache_creation_tokens"] += cw
+            bh["turns"] += turns
+            bh["duration_ms"] += dur
 
-            bp = by_provider.setdefault(provider, {
-                "provider": provider, "sessions": 0, "cost": 0.0,
+            # ISO week: year + "-W" + 2-digit week. isocalendar() returns
+            # a tuple; use .isoformat() friendly key.
+            iso_year, iso_week, _ = bucket_dt.isocalendar()
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            bw = by_week.setdefault(week_key, {
+                "week": week_key, "sessions": 0, "cost": 0.0,
                 "input_tokens": 0, "output_tokens": 0,
                 "cache_read_tokens": 0, "cache_creation_tokens": 0,
                 "turns": 0, "duration_ms": 0,
             })
-            bp["sessions"] += 1
-            bp["cost"] += cost
-            bp["input_tokens"] += inp
-            bp["output_tokens"] += out
-            bp["cache_read_tokens"] += cr
-            bp["cache_creation_tokens"] += cw
-            bp["turns"] += turns
-            bp["duration_ms"] += dur
+            bw["sessions"] += 1
+            bw["cost"] += cost
+            bw["input_tokens"] += inp
+            bw["output_tokens"] += out
+            bw["cache_read_tokens"] += cr
+            bw["cache_creation_tokens"] += cw
+            bw["turns"] += turns
+            bw["duration_ms"] += dur
 
-            bd = by_date.setdefault(date_dir.name, {
-                "date": date_dir.name, "sessions": 0, "cost": 0.0,
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_read_tokens": 0, "cache_creation_tokens": 0,
-                "turns": 0, "duration_ms": 0,
-            })
-            bd["sessions"] += 1
-            bd["cost"] += cost
-            bd["input_tokens"] += inp
-            bd["output_tokens"] += out
-            bd["cache_read_tokens"] += cr
-            bd["cache_creation_tokens"] += cw
-            bd["turns"] += turns
-            bd["duration_ms"] += dur
+            # Rolling totals: attribute to "last N" windows if the session
+            # started within that window. Same coarse-attribution caveat.
+            age = now_utc - bucket_dt
+            if age <= _td(hours=1):
+                totals["last_1h_cost"] += cost
+            if age <= _td(hours=24):
+                totals["last_24h_cost"] += cost
+            if age <= _td(days=7):
+                totals["last_7d_cost"] += cost
 
-            all_sessions.append({
-                "id": sid,
-                "date": date_dir.name,
-                "model": model,
-                "provider": provider,
-                "cost": round(cost, 4),
-                "turns": turns,
-                "duration_ms": dur,
-                "calls_per_hr": round(calls_per_hr, 1),
-                "prompt": meta.get("prompt", "")[:200],
-                "cwd": meta.get("cwd", ""),
-                "ctx_peak_pct": ctx["ctx_peak_pct"],
-                "ctx_peak_tokens": ctx["ctx_peak_tokens"],
-                "ctx_window": ctx["ctx_window"],
-            })
+        all_sessions.append({
+            "id": sid,
+            "date": date_bucket,
+            "model": model,
+            "provider": provider,
+            "mode": detect_mode(env),
+            "cost": round(cost, 4),
+            "turns": turns,
+            "duration_ms": dur,
+            "calls_per_hr": round(calls_per_hr, 1),
+            "prompt": meta.get("prompt", "")[:200],
+            "cwd": meta.get("cwd", ""),
+            "ctx_peak_pct": ctx["ctx_peak_pct"],
+            "ctx_peak_tokens": ctx["ctx_peak_tokens"],
+            "ctx_window": ctx["ctx_window"],
+        })
 
     # Round totals for cleaner JSON; compute calls/hr from aggregated duration
     def _cph(turns: int, dur_ms: int) -> float:
@@ -636,21 +906,54 @@ def build_stats() -> dict:
     for d in by_date.values():
         d["cost"] = round(d["cost"], 4)
         d["calls_per_hr"] = _cph(d["turns"], d["duration_ms"])
+    for h in by_hour.values():
+        h["cost"] = round(h["cost"], 4)
+        h["calls_per_hr"] = _cph(h["turns"], h["duration_ms"])
+    for w in by_week.values():
+        w["cost"] = round(w["cost"], 4)
+        w["calls_per_hr"] = _cph(w["turns"], w["duration_ms"])
+    totals["last_1h_cost"]  = round(totals["last_1h_cost"],  4)
+    totals["last_24h_cost"] = round(totals["last_24h_cost"], 4)
+    totals["last_7d_cost"]  = round(totals["last_7d_cost"],  4)
+
+    # Trim to display windows — last 30 days / last 72h / last 12 weeks.
+    # Ascending by key so the UI can plot left-to-right.
+    cutoff_day  = (now_utc - _td(days=30)).strftime("%Y-%m-%d")
+    cutoff_hour = (now_utc - _td(hours=72)).strftime("%Y-%m-%dT%H:00Z")
+    by_date_list = sorted(
+        (d for d in by_date.values() if d["date"] >= cutoff_day),
+        key=lambda x: x["date"],
+    )
+    by_hour_list = sorted(
+        (h for h in by_hour.values() if h["hour"] >= cutoff_hour),
+        key=lambda x: x["hour"],
+    )
+    by_week_list = sorted(by_week.values(), key=lambda x: x["week"])[-12:]
 
     by_model_list    = sorted(by_model.values(),    key=lambda x: -x["cost"])
     by_provider_list = sorted(by_provider.values(), key=lambda x: -x["cost"])
-    by_date_list     = sorted(by_date.values(),     key=lambda x: x["date"])
 
     top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])[:20]
     top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])[:20]
+
+    # Most expensive hours: catches "many cheap sessions add up" which
+    # top_by_cost (individual max) misses.
+    top_cost_windows = sorted(
+        by_hour.values(), key=lambda x: -x["cost"],
+    )[:10]
+    # Only include hours with non-trivial cost to avoid a list of zeros.
+    top_cost_windows = [h for h in top_cost_windows if h["cost"] >= 0.001]
 
     return {
         "totals": totals,
         "by_model": by_model_list,
         "by_provider": by_provider_list,
         "by_date": by_date_list,
+        "by_hour": by_hour_list,
+        "by_week": by_week_list,
         "top_by_cost": top_by_cost,
         "top_by_ctx": top_by_ctx,
+        "top_cost_windows": top_cost_windows,
     }
 
 
@@ -663,54 +966,64 @@ def _load_summary(session_dir: Path) -> dict:
 
 
 def _count_events(session_dir: Path) -> int:
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
-    if not path.exists():
-        return 0
+    """Sum events across all audit sources (handles resumed sessions)."""
     count = 0
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for _ in f:
-                count += 1
-    except Exception:
-        pass
+    for path in _audit_sources(session_dir):
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for _ in f:
+                    count += 1
+        except Exception:
+            continue
     return count
 
 
-def read_events(session_dir: Path) -> list:
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
-    if not path.exists():
-        return []
+def _audit_sources(session_dir: Path) -> list[Path]:
+    """Return the audit log files for a session in chronological order.
 
-    events = []
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if line:
+    A "resumed" session has BOTH audit.jsonl.gz (history from a previous
+    SessionEnd) AND audit.jsonl (events since the resume). Always read
+    .gz first when present so the timeline reads start-to-now even after
+    one or more resumes. The next SessionEnd will merge them back into
+    a single .gz; until then we just concatenate at read time.
+    """
+    sources = []
+    gz = session_dir / "audit.jsonl.gz"
+    jsonl = session_dir / "audit.jsonl"
+    if gz.exists():
+        sources.append(gz)
+    if jsonl.exists():
+        sources.append(jsonl)
+    return sources
+
+
+def read_events(session_dir: Path) -> list:
+    events: list = []
+    for path in _audit_sources(session_dir):
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
                         events.append(json.loads(line))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
-    except Exception:
-        pass
+        except Exception:
+            continue
     return events
 
 
-def resolve_session(date: str, session_id: str) -> Path | None:
+def resolve_session(session_id: str) -> Path | None:
     """Return the session dir if it exists AND is contained within AUDIT_DIR.
 
-    The containment check defends against path traversal via date/session_id
+    The containment check defends against path traversal via session_id
     components like "..", "/", or absolute paths injected through the URL.
     """
-    candidate = (AUDIT_DIR / date / session_id).resolve()
+    candidate = (AUDIT_DIR / session_id).resolve()
     try:
         candidate.relative_to(AUDIT_DIR.resolve())
     except ValueError:
@@ -1005,17 +1318,17 @@ class AuditHandler(SimpleHTTPRequestHandler):
             self._json(list_sessions())
         elif path.startswith("/api/sessions/") and path.endswith("/events"):
             parts = path.split("/")
-            # /api/sessions/<date>/<session-id>/events → 6 parts
-            if len(parts) == 6:
-                self._serve_events(parts[3], parts[4])
+            # /api/sessions/<session-id>/events → 5 parts
+            if len(parts) == 5:
+                self._serve_events(parts[3])
         elif path.startswith("/api/sessions/") and path.endswith("/stream"):
             parts = path.split("/")
-            if len(parts) == 6:
-                self._stream_events(parts[3], parts[4])
+            if len(parts) == 5:
+                self._stream_events(parts[3])
         elif path.startswith("/api/sessions/") and path.endswith("/meta"):
             parts = path.split("/")
-            if len(parts) == 6:
-                self._serve_meta(parts[3], parts[4])
+            if len(parts) == 5:
+                self._serve_meta(parts[3])
         elif path == "/api/memory":
             self._json(build_memory_index())
         elif path == "/api/memory/file":
@@ -1023,7 +1336,10 @@ class AuditHandler(SimpleHTTPRequestHandler):
         elif path == "/api/version":
             self._json(REPO_VERSION)
         elif path == "/api/stats":
-            self._json(build_stats())
+            from urllib.parse import parse_qs
+            qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            exclude = (qs.get("exclude_scripted") or ["0"])[0] in ("1", "true", "yes")
+            self._json(build_stats(exclude_scripted=exclude))
         elif path == "/api/skills":
             self._json(list_skills())
         elif path == "/api/skills/file":
@@ -1036,9 +1352,9 @@ class AuditHandler(SimpleHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path.startswith("/api/sessions/"):
             parts = path.split("/")
-            # /api/sessions/<date>/<session-id> → 5 parts
-            if len(parts) == 5:
-                self._delete_session(parts[3], parts[4])
+            # /api/sessions/<session-id> → 4 parts
+            if len(parts) == 4:
+                self._delete_session(parts[3])
                 return
         self.send_response(404)
         self.end_headers()
@@ -1051,8 +1367,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_events(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _serve_events(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1060,8 +1376,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
         events = read_events(session_dir)
         self._json(events)
 
-    def _stream_events(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _stream_events(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1109,6 +1425,12 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 if fh is None and jsonl.exists():
                     try:
                         fh = open(jsonl, "r", encoding="utf-8", errors="replace")
+                        # SSE is a live tail, NOT a replay. The frontend
+                        # already fetched everything via /events before
+                        # opening this stream — replaying the existing
+                        # content would render every line twice. Seek to
+                        # end so we only emit appended events.
+                        fh.seek(0, 2)
                     except OSError:
                         fh = None
 
@@ -1157,8 +1479,8 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 try: fh.close()
                 except Exception: pass
 
-    def _serve_meta(self, date: str, session_id: str):
-        session_dir = resolve_session(date, unquote(session_id))
+    def _serve_meta(self, session_id: str):
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1246,14 +1568,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _delete_session(self, date: str, session_id: str):
+    def _delete_session(self, session_id: str):
         """Delete a session directory. Refuses only if the session is
         genuinely live (audit.jsonl was touched within the last
         ACTIVE_WINDOW_S seconds and hasn't emitted SessionEnd yet).
         Stuck directories from crashed sessions and sub-agent leftovers
         are freely deletable. ?force=1 overrides even a live session.
         """
-        session_dir = resolve_session(date, unquote(session_id))
+        session_dir = resolve_session(unquote(session_id))
         if not session_dir:
             self.send_response(404)
             self.end_headers()
@@ -1273,15 +1595,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
             return
 
         # Cascade: also remove every sub-agent dir whose name starts with
-        # "<this_dir>__agent__". That covers direct children as well as
-        # grandchildren because __agent__ appears in every ancestor path.
-        # Note: this also cleans up if we're deleting a sub-agent itself —
-        # its own descendants (sub-sub-agents) share the same prefix.
-        date_dir = session_dir.parent
+        # "<this_dir>__agent__". Under flat layout these are siblings at
+        # AUDIT_DIR root, not under a date dir. Covers direct children
+        # plus grandchildren since __agent__ appears in every ancestor path.
+        siblings_root = session_dir.parent
         cascade_prefix = session_dir.name + SUBAGENT_SEP
         cascaded: list[str] = []
         try:
-            for sibling in date_dir.iterdir():
+            for sibling in siblings_root.iterdir():
                 if sibling.is_dir() and sibling.name.startswith(cascade_prefix):
                     try:
                         shutil.rmtree(sibling)
