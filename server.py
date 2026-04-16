@@ -638,20 +638,38 @@ def build_stats(exclude_scripted: bool = False) -> dict:
       top_by_cost: top 20 sessions by cost.
       top_by_ctx: top 20 sessions by ctx_peak_pct.
     """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now_utc = _dt.now(_tz.utc)
+
+    def _parse_ts(s):
+        if not isinstance(s, str):
+            return None
+        try:
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
     totals = {
         "sessions": 0, "cost": 0.0,
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "duration_ms": 0, "turns": 0,
+        # Rolling windows, populated below as we iterate.
+        "last_1h_cost":  0.0,
+        "last_24h_cost": 0.0,
+        "last_7d_cost":  0.0,
     }
     by_model: dict[str, dict] = {}
     by_provider: dict[str, dict] = {}
     by_date: dict[str, dict] = {}
+    by_hour: dict[str, dict] = {}    # "YYYY-MM-DDTHH:00Z" → agg
+    by_week: dict[str, dict] = {}    # ISO week key "YYYY-Www" → agg
     all_sessions: list[dict] = []
 
     if not AUDIT_DIR.exists():
-        return {"totals": totals, "by_model": [], "by_provider": [], "by_date": [],
-                "top_by_cost": [], "top_by_ctx": []}
+        return {"totals": totals, "by_model": [], "by_provider": [],
+                "by_date": [], "by_hour": [], "by_week": [],
+                "top_by_cost": [], "top_by_ctx": [], "top_cost_windows": []}
 
     for session_dir in sorted(AUDIT_DIR.iterdir()):
         if not session_dir.is_dir():
@@ -753,6 +771,58 @@ def build_stats(exclude_scripted: bool = False) -> dict:
         bd["turns"] += turns
         bd["duration_ms"] += dur
 
+        # Hour- and week-level buckets. We attribute the WHOLE session's
+        # cost to the hour/week it started — we do not have per-event
+        # cost data to split across hours for long-running sessions, so
+        # this is a documented approximation (same as by_date).
+        started_at = meta.get("started_at", "") or _last_active_iso(session_dir)
+        bucket_dt = _parse_ts(started_at)
+        if bucket_dt is not None:
+            hour_key = bucket_dt.strftime("%Y-%m-%dT%H:00Z")
+            bh = by_hour.setdefault(hour_key, {
+                "hour": hour_key, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "turns": 0, "duration_ms": 0,
+            })
+            bh["sessions"] += 1
+            bh["cost"] += cost
+            bh["input_tokens"] += inp
+            bh["output_tokens"] += out
+            bh["cache_read_tokens"] += cr
+            bh["cache_creation_tokens"] += cw
+            bh["turns"] += turns
+            bh["duration_ms"] += dur
+
+            # ISO week: year + "-W" + 2-digit week. isocalendar() returns
+            # a tuple; use .isoformat() friendly key.
+            iso_year, iso_week, _ = bucket_dt.isocalendar()
+            week_key = f"{iso_year}-W{iso_week:02d}"
+            bw = by_week.setdefault(week_key, {
+                "week": week_key, "sessions": 0, "cost": 0.0,
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "turns": 0, "duration_ms": 0,
+            })
+            bw["sessions"] += 1
+            bw["cost"] += cost
+            bw["input_tokens"] += inp
+            bw["output_tokens"] += out
+            bw["cache_read_tokens"] += cr
+            bw["cache_creation_tokens"] += cw
+            bw["turns"] += turns
+            bw["duration_ms"] += dur
+
+            # Rolling totals: attribute to "last N" windows if the session
+            # started within that window. Same coarse-attribution caveat.
+            age = now_utc - bucket_dt
+            if age <= _td(hours=1):
+                totals["last_1h_cost"] += cost
+            if age <= _td(hours=24):
+                totals["last_24h_cost"] += cost
+            if age <= _td(days=7):
+                totals["last_7d_cost"] += cost
+
         all_sessions.append({
             "id": sid,
             "date": date_bucket,
@@ -785,21 +855,54 @@ def build_stats(exclude_scripted: bool = False) -> dict:
     for d in by_date.values():
         d["cost"] = round(d["cost"], 4)
         d["calls_per_hr"] = _cph(d["turns"], d["duration_ms"])
+    for h in by_hour.values():
+        h["cost"] = round(h["cost"], 4)
+        h["calls_per_hr"] = _cph(h["turns"], h["duration_ms"])
+    for w in by_week.values():
+        w["cost"] = round(w["cost"], 4)
+        w["calls_per_hr"] = _cph(w["turns"], w["duration_ms"])
+    totals["last_1h_cost"]  = round(totals["last_1h_cost"],  4)
+    totals["last_24h_cost"] = round(totals["last_24h_cost"], 4)
+    totals["last_7d_cost"]  = round(totals["last_7d_cost"],  4)
+
+    # Trim to display windows — last 30 days / last 72h / last 12 weeks.
+    # Ascending by key so the UI can plot left-to-right.
+    cutoff_day  = (now_utc - _td(days=30)).strftime("%Y-%m-%d")
+    cutoff_hour = (now_utc - _td(hours=72)).strftime("%Y-%m-%dT%H:00Z")
+    by_date_list = sorted(
+        (d for d in by_date.values() if d["date"] >= cutoff_day),
+        key=lambda x: x["date"],
+    )
+    by_hour_list = sorted(
+        (h for h in by_hour.values() if h["hour"] >= cutoff_hour),
+        key=lambda x: x["hour"],
+    )
+    by_week_list = sorted(by_week.values(), key=lambda x: x["week"])[-12:]
 
     by_model_list    = sorted(by_model.values(),    key=lambda x: -x["cost"])
     by_provider_list = sorted(by_provider.values(), key=lambda x: -x["cost"])
-    by_date_list     = sorted(by_date.values(),     key=lambda x: x["date"])
 
     top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])[:20]
     top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])[:20]
+
+    # Most expensive hours: catches "many cheap sessions add up" which
+    # top_by_cost (individual max) misses.
+    top_cost_windows = sorted(
+        by_hour.values(), key=lambda x: -x["cost"],
+    )[:10]
+    # Only include hours with non-trivial cost to avoid a list of zeros.
+    top_cost_windows = [h for h in top_cost_windows if h["cost"] >= 0.001]
 
     return {
         "totals": totals,
         "by_model": by_model_list,
         "by_provider": by_provider_list,
         "by_date": by_date_list,
+        "by_hour": by_hour_list,
+        "by_week": by_week_list,
         "top_by_cost": top_by_cost,
         "top_by_ctx": top_by_ctx,
+        "top_cost_windows": top_cost_windows,
     }
 
 

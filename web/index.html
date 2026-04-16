@@ -148,6 +148,14 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
   background: var(--bg2); border: 1px solid var(--border); border-radius: 4px;
   padding: 10px 12px; min-height: 300px;
 }
+.dash-granularity-tabs { display: inline-flex; gap: 2px; }
+.dash-granularity-tabs button {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--gray);
+  padding: 2px 10px; border-radius: 3px; cursor: pointer; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.3px;
+}
+.dash-granularity-tabs button:hover { background: var(--border); color: var(--fg); }
+.dash-granularity-tabs button.active { background: var(--bg); color: var(--cyan); border-color: var(--cyan); }
 .dash-chart-box h4 { font-size: 11px; color: var(--gray); margin: 0 0 8px;
   text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
 .dash-chart-canvas { position: relative; height: 260px; }
@@ -1382,6 +1390,16 @@ function renderDashboard(s) {
   const avgCost = t.sessions ? (t.cost / t.sessions) : 0;
 
   let html = '';
+  // Rolling cost windows — answers "how fast have I been burning money"
+  // without needing a chart. Attribution caveat: each session's whole cost
+  // is attributed to the hour it STARTED, not split across its duration.
+  html += '<div class="dash-section-title">Rolling cost · session-start attribution</div>';
+  html += '<div class="dash-cards">';
+  html += `<div class="dash-card cost"><div class="label">Last 1h</div><div class="value">${_fmtCost(t.last_1h_cost || 0)}</div><div class="sub">sessions started in the last hour</div></div>`;
+  html += `<div class="dash-card cost"><div class="label">Last 24h</div><div class="value">${_fmtCost(t.last_24h_cost || 0)}</div><div class="sub">sessions started in the last 24 hours</div></div>`;
+  html += `<div class="dash-card cost"><div class="label">Last 7d</div><div class="value">${_fmtCost(t.last_7d_cost || 0)}</div><div class="sub">sessions started in the last 7 days</div></div>`;
+  html += '</div>';
+
   // Top cards
   html += '<div class="dash-section-title">Overview · all sessions</div>';
   html += '<div class="dash-cards">';
@@ -1400,10 +1418,19 @@ function renderDashboard(s) {
   html += '<div class="dash-chart-box"><h4>Cost by model</h4><div class="dash-chart-canvas"><canvas id="chartModelCost"></canvas></div></div>';
   html += '</div>';
 
-  // Daily trend (full-width)
+  // Time-granularity trend (full-width). User picks hour (last 72h) /
+  // day (last 30d) / week (last 12w). Chart redraws without refetching.
   html += '<div class="dash-charts-wide">';
-  html += '<div class="dash-chart-box"><h4>Daily trend</h4><div class="dash-chart-canvas"><canvas id="chartDailyCost"></canvas></div></div>';
-  html += '</div>';
+  html += '<div class="dash-chart-box">';
+  html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">';
+  html += '<h4 style="margin:0">Cost trend</h4>';
+  html += '<div class="dash-granularity-tabs">';
+  html += '<button data-gran="hour">Hour · 72h</button>';
+  html += '<button data-gran="day" class="active">Day · 30d</button>';
+  html += '<button data-gran="week">Week · 12w</button>';
+  html += '</div></div>';
+  html += '<div class="dash-chart-canvas"><canvas id="chartCostTrend"></canvas></div>';
+  html += '</div></div>';
 
   // Provider breakdown table
   html += '<div class="dash-table-box"><h4>Provider breakdown</h4>';
@@ -1449,9 +1476,25 @@ function renderDashboard(s) {
   }
   html += '</tbody></table></div>';
 
-  // Top sessions
+  // Most expensive hours — catches "many cheap sessions add up" which the
+  // next table (ranked by single-session cost) misses by design.
+  html += '<div class="dash-table-box"><h4>Most expensive hours</h4>';
+  html += '<table class="dash-table"><thead><tr><th>Hour (UTC)</th><th class="num">Sessions</th><th class="num">Cost</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th></tr></thead><tbody>';
+  for (const w of (s.top_cost_windows || [])) {
+    html += '<tr>';
+    html += `<td>${esc((w.hour || '').replace('T', ' ').replace(':00Z', ':00'))}</td>`;
+    html += `<td class="num">${w.sessions}</td>`;
+    html += `<td class="num">${_fmtCost(w.cost)}</td>`;
+    html += `<td class="num">${_fmtNum(w.input_tokens)}</td>`;
+    html += `<td class="num">${_fmtNum(w.output_tokens)}</td>`;
+    html += `<td class="num">${_fmtNum(w.cache_read_tokens)}</td>`;
+    html += '</tr>';
+  }
+  html += '</tbody></table></div>';
+
+  // Individual-session rankings
   html += '<div class="dash-top-grid">';
-  html += '<div class="dash-table-box"><h4>Top 20 sessions by cost</h4>';
+  html += '<div class="dash-table-box"><h4>Top 20 individual sessions by cost</h4>';
   html += '<table class="dash-table"><thead><tr><th>Date</th><th>Provider</th><th>Model</th><th class="num">Cost</th><th class="num">Calls/hr</th><th>Prompt</th></tr></thead><tbody>';
   for (const r of s.top_by_cost) {
     html += `<tr data-date="${escAttr(r.date)}" data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
@@ -1500,7 +1543,17 @@ function renderDashboard(s) {
   // Render charts after DOM is in place
   _drawProviderCostChart(s.by_provider);
   _drawModelCostChart(s.by_model);
-  _drawDailyCostChart(s.by_date);
+  _drawCostTrend(s, 'day');
+
+  // Granularity tab clicks. Re-draw the trend chart without refetching
+  // since all three series are already in the stats payload.
+  panel.querySelectorAll('.dash-granularity-tabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      panel.querySelectorAll('.dash-granularity-tabs button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      _drawCostTrend(s, btn.dataset.gran);
+    });
+  });
 }
 
 const PROVIDER_COLORS = {
@@ -1570,14 +1623,40 @@ function _drawModelCostChart(models) {
   dashboardChartsInstances.push(c);
 }
 
-function _drawDailyCostChart(days) {
-  const ctx = document.getElementById('chartDailyCost');
+let _costTrendChart = null;
+
+function _drawCostTrend(s, gran) {
+  const ctx = document.getElementById('chartCostTrend');
   if (!ctx || !window.Chart) return;
-  const labels = days.map(d => d.date);
-  const costs  = days.map(d => d.cost);
-  const sess   = days.map(d => d.sessions);
-  const cph    = days.map(d => d.calls_per_hr || 0);
-  const c = new Chart(ctx, {
+
+  let src, keyField, labelFmt;
+  if (gran === 'hour') {
+    src = s.by_hour || [];
+    keyField = 'hour';
+    // "2026-04-15T17:00Z" → "04-15 17:00"
+    labelFmt = (v) => (v || '').replace(/^\d{4}-/, '').replace('T', ' ').replace(':00Z', '');
+  } else if (gran === 'week') {
+    src = s.by_week || [];
+    keyField = 'week';
+    labelFmt = (v) => v;  // "2026-W15"
+  } else {
+    src = s.by_date || [];
+    keyField = 'date';
+    labelFmt = (v) => v;
+  }
+
+  const labels = src.map(r => labelFmt(r[keyField]));
+  const costs  = src.map(r => r.cost);
+  const sess   = src.map(r => r.sessions);
+  const cph    = src.map(r => r.calls_per_hr || 0);
+
+  // Tear down previous instance so Chart.js does not leak or double-render.
+  if (_costTrendChart) {
+    try { _costTrendChart.destroy(); } catch (e) {}
+    _costTrendChart = null;
+  }
+
+  _costTrendChart = new Chart(ctx, {
     type: 'line',
     data: {
       labels,
@@ -1595,10 +1674,14 @@ function _drawDailyCostChart(days) {
       interaction: { mode: 'index', intersect: false },
       plugins: { legend: { labels: { color: '#d4d4d4', font: { size: 11 } } } },
       scales: {
-        x: { ticks: { color: '#888', font: { size: 10 } }, grid: { color: '#3c3c3c' } },
-        y: { type: 'linear', position: 'left', ticks: { color: '#6a9955', font: { size: 10 },
-             callback: v => '$' + Number(v).toFixed(2) }, grid: { color: '#3c3c3c' } },
-        y1: { type: 'linear', position: 'right', ticks: { color: '#4ec9b0', font: { size: 10 } },
+        x: { ticks: { color: '#888', font: { size: 10 }, maxRotation: 0, autoSkipPadding: 20 },
+             grid: { color: '#3c3c3c' } },
+        y: { type: 'linear', position: 'left',
+             ticks: { color: '#6a9955', font: { size: 10 },
+                      callback: v => '$' + Number(v).toFixed(2) },
+             grid: { color: '#3c3c3c' } },
+        y1: { type: 'linear', position: 'right',
+              ticks: { color: '#4ec9b0', font: { size: 10 } },
               grid: { drawOnChartArea: false } },
         y2: { type: 'linear', position: 'right', offset: true,
               ticks: { color: '#dcdcaa', font: { size: 10 } },
@@ -1606,7 +1689,7 @@ function _drawDailyCostChart(days) {
       }
     }
   });
-  dashboardChartsInstances.push(c);
+  dashboardChartsInstances.push(_costTrendChart);
 }
 
 // ========== Memory view ==========
