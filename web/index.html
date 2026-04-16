@@ -509,13 +509,7 @@ function _updateScriptedToggleLabel() {
   if (!lbl) return;
   if (total === 0) { lbl.style.display = 'none'; return; }
   lbl.style.display = '';
-  // Keep the checkbox + rewrite only the text after it
-  const chk = document.getElementById('showScriptedChk');
-  if (chk) chk.checked = showScripted;
-  lbl.childNodes.forEach(n => {
-    if (n.nodeType === 3) n.textContent = ` show scripted (${scripted}/${total} hidden)`;
-  });
-  // Simpler fallback: overwrite label contents, preserving the input.
+  // Rebuild the label from scratch so we can wire a fresh change handler.
   lbl.innerHTML = '';
   const input = document.createElement('input');
   input.type = 'checkbox'; input.id = 'showScriptedChk';
@@ -632,10 +626,10 @@ function renderList() {
             <span class="time">${esc(time)}</span>
             ${chipHtml}
             ${unclosedHtml}
-            <span class="${cwdClass}" title="${esc(s.cwd || '')}">${esc(cwdBase)}</span>
+            <span class="${cwdClass}" title="${escAttr(s.cwd || '')}">${esc(cwdBase)}</span>
             <button class="del-btn" title="Delete session" onclick="deleteSession(event, '${s.id}')">✕</button>
           </div>
-          <div class="${promptClass}" title="${esc(promptText)}">${esc(promptDisplay)}</div>
+          <div class="${promptClass}" title="${escAttr(promptText)}">${esc(promptDisplay)}</div>
           <div class="meta">${metaHtml}</div>
         </div>
       </div>`;
@@ -751,7 +745,7 @@ async function loadMeta(sessionId) {
     ${ctxHtml ? `<div class="info-item"><label>Ctx: </label>${ctxHtml}</div>` : ''}
     <div class="info-item"><label>Status: </label><span>${esc(s.reason || 'active')}</span></div>
     <button class="resume-btn" onclick="copyResume(this, '${sessionId}', '${safeCwd}')">📋 Resume</button>
-    <div class="prompt-bar" title="${esc(m.prompt || '')}">${esc(m.prompt || '—')}</div>
+    <div class="prompt-bar" title="${escAttr(m.prompt || '')}">${esc(m.prompt || '—')}</div>
   `;
 }
 

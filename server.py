@@ -451,54 +451,105 @@ def list_sessions() -> dict:
 
 
 def _load_meta(session_dir: Path, sid: str) -> dict:
+    """Return metadata.json if parseable, otherwise extract from events.
+
+    metadata.json may exist but only contain the last_active_at cache
+    without the SessionStart fields (if _last_active_iso ran before
+    anyone else populated the file). In that case we still need to
+    extract from events to recover prompt/model/cwd.
+
+    Concurrent-write tolerance: the file can be rewritten under us by
+    either _last_active_iso (atomic via os.replace) or the older
+    non-atomic path in _extract_meta_from_events. Any parse failure
+    falls through to the event-based extractor.
+    """
     meta_path = session_dir / "metadata.json"
     if meta_path.exists():
-        with open(meta_path) as f:
-            return json.load(f)
-    # Fallback: extract from first event
+        try:
+            with open(meta_path) as f:
+                cached = json.load(f)
+            # Only trust the cache if it carries the real metadata,
+            # not just the last_active_at helper fields.
+            if isinstance(cached, dict) and (
+                cached.get("model") or cached.get("prompt") or cached.get("cwd")
+            ):
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Fallback: extract from events (also covers the "only last_active"
+    # shell case created by _last_active_iso on a session that has not
+    # yet had its real metadata extracted).
     return _extract_meta_from_events(session_dir, sid)
 
 
 def _extract_meta_from_events(session_dir: Path, sid: str) -> dict:
-    meta = {"prompt": "", "model": "", "cwd": ""}
-    jsonl = session_dir / "audit.jsonl"
-    gz = session_dir / "audit.jsonl.gz"
-    path = jsonl if jsonl.exists() else gz
+    """Walk the audit log(s) for the SessionStart + first UserPromptSubmit.
 
-    if not path.exists():
+    For resumed sessions we must read BOTH the .gz (original SessionStart
+    lives there) and the .jsonl (resume delta). Reading only one would
+    miss either the start event or any newer prompt.
+    """
+    meta = {"prompt": "", "model": "", "cwd": "", "started_at": ""}
+
+    # _audit_sources returns gz first then jsonl, chronological for our
+    # purposes — which is what we want here (earliest SessionStart wins).
+    sources = _audit_sources(session_dir)
+    if not sources:
         return meta
 
-    opener = gzip.open if str(path).endswith(".gz") else open
-    mode = "rt" if str(path).endswith(".gz") else "r"
-    try:
-        with opener(path, mode, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                    d = obj.get("data", {})
+    for path in sources:
+        opener = gzip.open if path.name.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    d = obj.get("data", {}) if isinstance(obj.get("data"), dict) else {}
                     if obj.get("event") == "SessionStart":
-                        meta["model"] = d.get("model", "")
-                        meta["cwd"] = d.get("cwd", "")
-                        meta["started_at"] = obj.get("ts", "")
+                        if not meta["model"]:
+                            meta["model"] = d.get("model", "") or ""
+                        if not meta["cwd"]:
+                            meta["cwd"] = d.get("cwd", "") or ""
+                        if not meta["started_at"]:
+                            meta["started_at"] = obj.get("ts", "") or ""
                     elif obj.get("event") == "UserPromptSubmit":
-                        prompt = d.get("prompt", "")[:200]
+                        prompt = (d.get("prompt", "") or "")[:200]
                         if prompt and not meta["prompt"]:
                             meta["prompt"] = prompt
                     if meta["model"] and meta["prompt"]:
                         break
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-    except Exception:
-        pass
-
-    # Persist metadata so we don't re-parse next time
-    if meta.get("model") or meta.get("prompt"):
-        try:
-            with open(session_dir / "metadata.json", "w") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            continue
+        if meta["model"] and meta["prompt"]:
+            break
 
+    # Persist so we don't re-parse next time. Merge with any cache that
+    # _last_active_iso already dropped in — preserve its fields.
+    if meta.get("model") or meta.get("prompt"):
+        meta_path = session_dir / "metadata.json"
+        merged = {}
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    merged = dict(existing)
+            except (OSError, json.JSONDecodeError):
+                pass
+        for k, v in meta.items():
+            if v and not merged.get(k):
+                merged[k] = v
+        # Atomic write — protects concurrent readers from mid-write tearing.
+        try:
+            tmp = meta_path.with_name(meta_path.name + ".tmp")
+            with open(tmp, "w") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, meta_path)
+        except OSError:
+            pass
+        return merged
     return meta
 
 
