@@ -9,7 +9,7 @@
   --bg: #1e1e1e; --fg: #d4d4d4; --bg2: #252526; --bg3: #2d2d2d;
   --border: #3c3c3c; --blue: #569cd6; --green: #6a9955;
   --yellow: #dcdcaa; --red: #f44747; --orange: #ce9178;
-  --cyan: #4ec9b0; --gray: #888;
+  --cyan: #4ec9b0; --gray: #888; --purple: #c586c0;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); font-size: 12px; height: 100vh; overflow: hidden; }
@@ -223,6 +223,11 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
   border-radius: 3px; padding: 0 4px; font-size: 9px; font-family: inherit;
   flex-shrink: 0;
 }
+.session-item .headless-chip {
+  background: var(--bg3); color: var(--gray); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 4px; font-size: 9px; font-family: inherit;
+  flex-shrink: 0; cursor: help;
+}
 .session-item .unclosed-chip {
   color: var(--yellow); font-size: 11px; flex-shrink: 0; cursor: help;
 }
@@ -300,8 +305,18 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 .event-row.user-prompt .tool-name { color: var(--orange); font-weight: 600; }
 .event-row.stop-msg { color: var(--green); border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
 .event-row.session-end { color: var(--green); border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
+
+/* Transcript event styles */
+.event-row.assistant-text { background: rgba(100, 160, 255, 0.08); border-left: 3px solid var(--blue); margin: 3px 0; padding-top: 2px; padding-bottom: 2px; }
+.event-row.assistant-text .tool-name { color: var(--blue); font-weight: 600; }
+.assistant-text-preview { color: var(--fg); font-weight: normal; }
+.event-row.thinking { background: rgba(160, 120, 255, 0.06); border-left: 2px solid var(--purple); margin: 2px 0; padding-top: 1px; padding-bottom: 1px; }
+.thinking-preview { color: var(--gray); font-style: italic; }
+.user-prompt-text { color: var(--orange); font-weight: normal; }
 .event-row.subagent-start { color: var(--cyan); }
 .event-row.subagent-stop { color: var(--cyan); border-top: 1px solid var(--border); margin-top: 2px; padding-top: 2px; }
+.event-row.subagent-breadcrumb { padding: 6px 8px; background: var(--bg2); border-bottom: 1px solid var(--border); font-size: 12px; }
+.expand-btn.subagent-btn { background: var(--cyan); color: var(--bg1); border: none; font-weight: 600; }
 .event-row.checkpoint { color: var(--gray); background: var(--bg2); border-left: 2px solid var(--yellow); }
 .event-row.checkpoint .tool-name { color: var(--yellow); }
 .event-row.assistant-msg { color: var(--fg); }
@@ -337,6 +352,23 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 .detail-content.input-panel { color: var(--gray); }
 .detail-content.result-panel { color: var(--fg); }
 .detail-content.error-panel { color: var(--red); }
+
+/* JSON / code syntax highlighting */
+.json-block, .code-block {
+  margin: 0; padding: 6px 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  background: transparent; border: none; overflow-x: auto;
+}
+.json-key { color: var(--cyan); }
+.json-string { color: var(--green); }
+.json-number { color: var(--orange); }
+.json-bool { color: var(--yellow); }
+.json-null { color: var(--gray); font-style: italic; }
+
+
+/* Death record (watchdog detected SIGKILL/OOM) */
+.event-row.death-record { background: rgba(244,71,71,0.08); border: 1px solid var(--red); border-radius: 3px; }
+.death-chip { font-size: 11px; cursor: help; }
 
 /* Loading */
 .loading { text-align: center; padding: 30px; color: var(--gray); }
@@ -466,6 +498,8 @@ let activeSessionId = null;
 let showScripted = false;
 try { showScripted = localStorage.getItem('auditit.showScripted') === '1'; } catch (e) {}
 let pendingToolCalls = {};
+// Sub-agents for the currently viewed session: {agent_id: {id, agent_type, description, source}}
+let currentSubagents = {};
 // Stack of active sub-agents for the current session. Each element is
 // {agent_type, start_ts} pushed on SubagentStart and popped on SubagentStop.
 // Stack depth is the current nesting level for all in-between events.
@@ -613,10 +647,17 @@ function renderList() {
       const chipHtml = (s.is_subagent && s.agent_type)
         ? `<span class="agent-chip">${esc(s.agent_type)}</span>`
         : '';
+      const headlessHtml = s.is_headless
+        ? '<span class="headless-chip" title="claude -p (headless/scripted)">-p</span>'
+        : '';
       // ⚠ marker for sub-agents whose SubagentStop never arrived (Claude
       // Code sometimes skips it). reason comes from summary.json.
       const unclosedHtml = (s.is_subagent && s.reason && s.reason !== 'normal')
         ? `<span class="unclosed-chip" title="Sub-agent closed without a matching SubagentStop (${esc(s.reason)})">⚠</span>`
+        : '';
+      // 💀 marker for sessions killed by SIGKILL/OOM (death.json detected)
+      const deathHtml = s.has_death
+        ? `<span class="death-chip" title="Process killed without SessionEnd (SIGKILL/OOM/crash)">💀</span>`
         : '';
       html += `<div class="session-item${isActive}${subClass}" onclick="openSession('${s.id}')">
         ${treeBars ? `<span class="tree-bars">${treeBars}</span>` : ''}
@@ -625,7 +666,9 @@ function renderList() {
           <div class="headline">
             <span class="time">${esc(time)}</span>
             ${chipHtml}
+            ${headlessHtml}
             ${unclosedHtml}
+            ${deathHtml}
             <span class="${cwdClass}" title="${escAttr(s.cwd || '')}">${esc(cwdBase)}</span>
             <button class="del-btn" title="Delete session" onclick="deleteSession(event, '${s.id}')">✕</button>
           </div>
@@ -698,7 +741,7 @@ function openSession(sessionId) {
   }
 
   loadMeta(sessionId);
-  loadEvents(sessionId, isActive);
+  loadSubagents(sessionId).then(() => loadEvents(sessionId, isActive));
 }
 
 function _fmtCtx(s) {
@@ -743,10 +786,16 @@ async function loadMeta(sessionId) {
     <div class="info-item"><label>Cost: </label><span>${cost}</span></div>
     <div class="info-item"><label>Duration: </label><span>${dur}</span></div>
     ${ctxHtml ? `<div class="info-item"><label>Ctx: </label>${ctxHtml}</div>` : ''}
-    <div class="info-item"><label>Status: </label><span>${esc(s.reason || 'active')}</span></div>
+    <div class="info-item"><label>Status: </label><span>${data.death ? '<span style="color:var(--red);font-weight:600">💀 KILLED</span>' : esc(s.reason || 'active')}</span></div>
     <button class="resume-btn" onclick="copyResume(this, '${sessionId}', '${safeCwd}')">📋 Resume</button>
     <div class="prompt-bar" title="${escAttr(m.prompt || '')}">${esc(m.prompt || '—')}</div>
   `;
+
+  // If session was killed (death.json), render death record at top of event stream
+  if (data.death) {
+    const eventContainer = document.getElementById('eventStream');
+    if (eventContainer) renderDeathRecord(data.death, eventContainer);
+  }
 }
 
 function writeClipboard(text) {
@@ -791,28 +840,73 @@ function copyResume(btn, sessionId, cwd) {
     .catch(() => flashCopied(btn, '✗ Failed', '📋 Resume'));
 }
 
+// ========== Sub-agents ==========
+async function loadSubagents(sessionId) {
+  currentSubagents = {};
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/subagents`);
+    if (!res.ok) return;
+    const list = await res.json();
+    for (const sa of list) {
+      // sa.id is like "agent-a0f4f3db70580246d"
+      currentSubagents[sa.id] = sa;
+    }
+  } catch {}
+}
+
+function openSubagent(agentId) {
+  // Load the sub-agent's transcript in the same detail view
+  const log = document.getElementById('eventLog');
+  log.innerHTML = '<div class="loading">Loading sub-agent...</div>';
+  pendingToolCalls = {};
+  subagentStack = [];
+  fetch(`/api/sessions/${encodeURIComponent(agentId)}/transcript`)
+    .then(r => r.ok ? r.json() : Promise.reject('no transcript'))
+    .then(data => {
+      if (!data || !data.events || data.events.length === 0) return Promise.reject('empty');
+      log.innerHTML = '';
+      // Add a breadcrumb back to parent
+      const bc = document.createElement('div');
+      bc.className = 'event-row subagent-breadcrumb';
+      bc.innerHTML = `<span style="color:var(--cyan);cursor:pointer" onclick="openSession('${esc(activeSessionId || '')}')">← back to parent</span> &nbsp; <span style="color:var(--gray)">${esc(agentId)}</span>`;
+      log.appendChild(bc);
+      renderTranscriptEvents(data.events, log);
+      log.scrollTop = log.scrollHeight;
+    })
+    .catch(() => { log.innerHTML = '<div class="loading">No transcript available for this sub-agent</div>'; });
+}
+
 // ========== Events (SSE) ==========
 function loadEvents(sessionId, isActive) {
   if (currentStream) { currentStream.close(); currentStream = null; }
   const log = document.getElementById('eventLog');
 
-  fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
-    .then(r => r.json())
-    .then(events => {
+  // Try transcript first — it has the full conversation (assistant text, thinking, etc.)
+  fetch(`/api/sessions/${encodeURIComponent(sessionId)}/transcript`)
+    .then(r => r.ok ? r.json() : Promise.reject('no transcript'))
+    .then(data => {
+      if (!data || !data.events || data.events.length === 0) return Promise.reject('empty transcript');
       log.innerHTML = '';
       pendingToolCalls = {};
       subagentStack = [];
-      events.forEach(e => processEvent(e, log));
-      // Auto-scroll to the latest event on initial load. SSE updates
-      // already do this; this matches the behaviour for fetch-only
-      // (completed sessions and the initial paint of live ones).
+      renderTranscriptEvents(data.events, log);
       log.scrollTop = log.scrollHeight;
     })
-    .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
+    .catch(() => {
+      // Fallback to audit events
+      fetch(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
+        .then(r => r.json())
+        .then(events => {
+          log.innerHTML = '';
+          pendingToolCalls = {};
+          subagentStack = [];
+          events.forEach(e => processEvent(e, log));
+          log.scrollTop = log.scrollHeight;
+        })
+        .catch(() => { log.innerHTML = '<div class="loading">Failed to load</div>'; });
+    });
 
   // Only open SSE stream for active (live) sessions.
-  // Completed sessions are fully available via the fetch above;
-  // opening SSE would replay all events a second time.
   if (!isActive) return;
 
   const evtSource = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/stream`);
@@ -873,6 +967,236 @@ function processEvent(event, container) {
   }
 }
 
+// ========== Transcript rendering ==========
+function renderTranscriptEvents(events, container) {
+  for (const e of events) {
+    const t = e.type;
+    const ts = e.timestamp ? formatLocalTime(e.timestamp) : '';
+
+    if (t === 'user_text') {
+      renderTranscriptUserText(ts, e, container);
+    } else if (t === 'assistant_text') {
+      renderTranscriptAssistantText(ts, e, container);
+    } else if (t === 'assistant_thinking') {
+      renderTranscriptThinking(ts, e, container);
+    } else if (t === 'assistant_tool_use') {
+      renderTranscriptToolUse(ts, e, container);
+    } else if (t === 'tool_result') {
+      renderTranscriptToolResult(ts, e, container);
+    }
+  }
+}
+
+function renderTranscriptUserText(ts, e, container) {
+  const text = e.text || '';
+  // Strip <local-command-caveat>...</local-command-caveat> wrapper
+  let clean = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, '').trim();
+  if (!clean) return;
+
+  // Handle /commands
+  const cmdMatch = clean.match(/^<command-name>([^<]+)<\/command-name>/);
+  if (cmdMatch) {
+    const row = makeRow(ts, '⚡', cmdMatch[1], '', 'user-prompt');
+    container.appendChild(row);
+    return;
+  }
+
+  const preview = clean.length > 200 ? clean.substring(0, 200) + '…' : clean;
+  const row = makeRow(ts, '👤', 'USER', `<span class="user-prompt-text">${esc(preview)}</span>`, 'user-prompt');
+  row.querySelector('.status-text').style.whiteSpace = 'pre-wrap';
+
+  // Expandable full text
+  const panel = document.createElement('div');
+  panel.className = 'detail-content input-panel';
+  panel.innerHTML = `<pre class="json-block">${esc(clean)}</pre>`;
+
+  const btn = document.createElement('button');
+  btn.className = 'expand-btn';
+  btn.textContent = 'full';
+  btn.onclick = () => {
+    const open = panel.classList.toggle('open');
+    btn.textContent = open ? 'hide' : 'full';
+  };
+  row.querySelector('.actions').appendChild(btn);
+
+  container.appendChild(row);
+  container.appendChild(panel);
+}
+
+function renderTranscriptAssistantText(ts, e, container) {
+  const text = e.text || '';
+  if (!text.trim()) return;
+
+  const preview = text.length > 200 ? text.substring(0, 200) + '…' : text;
+  const row = makeRow(ts, '🤖', 'ASSISTANT', `<span class="assistant-text-preview">${esc(preview)}</span>`, 'assistant-text');
+  row.querySelector('.status-text').style.whiteSpace = 'pre-wrap';
+
+  const panel = document.createElement('div');
+  panel.className = 'detail-content input-panel';
+  panel.innerHTML = `<pre class="json-block">${esc(text)}</pre>`;
+
+  const btn = document.createElement('button');
+  btn.className = 'expand-btn';
+  btn.textContent = 'full';
+  btn.onclick = () => {
+    const open = panel.classList.toggle('open');
+    btn.textContent = open ? 'hide' : 'full';
+  };
+  row.querySelector('.actions').appendChild(btn);
+
+  container.appendChild(row);
+  container.appendChild(panel);
+}
+
+function renderTranscriptThinking(ts, e, container) {
+  const text = e.text || '';
+  if (!text.trim()) return;
+
+  const preview = text.length > 120 ? text.substring(0, 120) + '…' : text;
+  const row = makeRow(ts, '💭', 'THINKING', `<span class="thinking-preview">${esc(preview)}</span>`, 'thinking');
+  row.querySelector('.status-text').style.whiteSpace = 'pre-wrap';
+  row.style.opacity = '0.6';
+
+  const panel = document.createElement('div');
+  panel.className = 'detail-content input-panel';
+  panel.innerHTML = `<pre class="json-block">${esc(text)}</pre>`;
+
+  const btn = document.createElement('button');
+  btn.className = 'expand-btn';
+  btn.textContent = 'think';
+  btn.onclick = () => {
+    const open = panel.classList.toggle('open');
+    btn.textContent = open ? 'hide' : 'think';
+  };
+  row.querySelector('.actions').appendChild(btn);
+
+  container.appendChild(row);
+  container.appendChild(panel);
+}
+
+function renderTranscriptToolUse(ts, e, container) {
+  const toolName = e.name || '?';
+  const toolUseId = e.id || '';
+
+  const row = makeRow(ts, '🔧', toolName, '', 'tool-call');
+  row.classList.add('tool-' + toolName);
+
+  const panel = document.createElement('div');
+  panel.className = 'detail-content input-panel';
+  panel.innerHTML = e.input ? formatContent(e.input) : '';
+
+  const btn = document.createElement('button');
+  btn.className = 'expand-btn';
+  btn.textContent = 'input';
+  btn.onclick = () => {
+    const open = panel.classList.toggle('open');
+    btn.textContent = open ? 'hide' : 'input';
+  };
+  row.querySelector('.actions').appendChild(btn);
+
+  // If this is an Agent tool call, show visual indicator
+  if (toolName === 'Agent') {
+    const input = e.input || {};
+    const desc = input.description || input.prompt || '';
+    if (desc) {
+      row.querySelector('.status-text').innerHTML = `<span style="color:var(--cyan)">${esc(desc.substring(0, 80))}</span>`;
+    }
+  }
+
+  container.appendChild(row);
+  container.appendChild(panel);
+
+  if (toolUseId) {
+    pendingToolCalls[toolUseId] = { row, panel, btn, name: toolName, input: e.input || {} };
+  }
+}
+
+function renderTranscriptToolResult(ts, e, container) {
+  const toolUseId = e.tool_use_id || '';
+  const toolName = e.tool_name || '';
+  const content = e.content || '';
+  const isError = e.is_error || false;
+  const pending = pendingToolCalls[toolUseId] || null;
+
+  // Extract agentId from Agent tool_result content
+  let extractedAgentId = '';
+  if (toolName === 'Agent') {
+    const text = typeof content === 'string' ? content
+      : (Array.isArray(content) ? content.map(c => typeof c === 'object' && c.text ? c.text : String(c)).join(' ') : String(content));
+    const m = text.match(/agentId:\s*(\S+)/);
+    if (m) extractedAgentId = 'agent-' + m[1];
+  }
+
+  const respStr = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+  const summaryHtml = toolSummary(toolName, pending?.input || {}, content, isError);
+
+  if (pending) {
+    pending.row.className = 'event-row tool-result tool-' + toolName + (isError ? ' error' : '');
+    pending.row.querySelector('.icon').textContent = isError ? '❌' : '✔';
+    pending.row.querySelector('.tool-name').style.color = isError ? 'var(--red)' : 'var(--yellow)';
+    pending.row.querySelector('.status-text').innerHTML = summaryHtml;
+    pending.row.querySelector('.status-text').style.color = isError ? 'var(--red)' : 'var(--fg)';
+    pending.row.querySelector('.status-text').style.whiteSpace = 'normal';
+
+    const actions = pending.row.querySelector('.actions');
+    actions.innerHTML = '';
+
+    const resultPanel = document.createElement('div');
+    resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
+    resultPanel.innerHTML = formatContent(content);
+
+    const rbtn = document.createElement('button');
+    rbtn.className = 'expand-btn';
+    rbtn.textContent = 'full';
+    rbtn.onclick = () => {
+      const open = resultPanel.classList.toggle('open');
+      rbtn.textContent = open ? 'hide' : 'full';
+    };
+    actions.appendChild(rbtn);
+
+    // Add "view agent" button if agentId found and sub-agent exists
+    if (extractedAgentId && currentSubagents[extractedAgentId]) {
+      const subBtn = document.createElement('button');
+      subBtn.className = 'expand-btn subagent-btn';
+      subBtn.textContent = 'agent';
+      subBtn.title = 'View sub-agent transcript';
+      subBtn.onclick = () => openSubagent(extractedAgentId);
+      actions.appendChild(subBtn);
+    }
+
+    pending.row.after(resultPanel);
+    delete pendingToolCalls[toolUseId];
+  } else {
+    // Standalone result (no matching tool call)
+    const resultRow = makeRow(ts, isError ? '❌' : '✔', toolName, summaryHtml, 'tool-result tool-' + toolName + (isError ? ' error' : ''));
+    resultRow.style.opacity = '0.5';
+    resultRow.querySelector('.status-text').style.whiteSpace = 'normal';
+
+    const resultPanel = document.createElement('div');
+    resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
+    resultPanel.innerHTML = formatContent(content);
+
+    const rbtn = document.createElement('button');
+    rbtn.className = 'expand-btn';
+    rbtn.textContent = 'full';
+    rbtn.onclick = () => resultPanel.classList.toggle('open');
+    resultRow.querySelector('.actions').appendChild(rbtn);
+
+    // Add sub-agent button for standalone Agent results too
+    if (extractedAgentId && currentSubagents[extractedAgentId]) {
+      const subBtn = document.createElement('button');
+      subBtn.className = 'expand-btn subagent-btn';
+      subBtn.textContent = 'agent';
+      subBtn.title = 'View sub-agent transcript';
+      subBtn.onclick = () => openSubagent(extractedAgentId);
+      resultRow.querySelector('.actions').appendChild(subBtn);
+    }
+
+    container.appendChild(resultRow);
+    container.appendChild(resultPanel);
+  }
+}
+
 function renderSessionStart(ts, d, container) {
   container.append(makeRow(ts, '⚙', 'SESSION', `START ${esc(d.model||'')} ${esc((d.session_id||d.sessionId||'').substring(0,8))}`, 'session-start'));
 }
@@ -915,7 +1239,7 @@ function renderToolCall(ts, d, container) {
   const actions = row.querySelector('.actions');
   const inputPanel = document.createElement('div');
   inputPanel.className = 'detail-content input-panel';
-  inputPanel.textContent = input;
+  inputPanel.innerHTML = d.tool_input ? formatContent(d.tool_input) : esc(input);
 
   const btn = document.createElement('button');
   btn.className = 'expand-btn';
@@ -1015,7 +1339,7 @@ function renderToolResult(ts, d, isError, container) {
 
     const resultPanel = document.createElement('div');
     resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
-    resultPanel.textContent = respStr;
+    resultPanel.innerHTML = formatContent(response);
 
     const rbtn = document.createElement('button');
     rbtn.className = 'expand-btn';
@@ -1038,7 +1362,7 @@ function renderToolResult(ts, d, isError, container) {
 
     const resultPanel = document.createElement('div');
     resultPanel.className = 'detail-content' + (isError ? ' error-panel' : ' result-panel');
-    resultPanel.textContent = respStr;
+    resultPanel.innerHTML = formatContent(response);
 
     const rbtn = document.createElement('button');
     rbtn.className = 'expand-btn';
@@ -1082,6 +1406,16 @@ function renderSessionEnd(ts, d, container) {
   const turns = d.num_turns||0;
   const dur = d.duration_ms ? (d.duration_ms/1000).toFixed(1)+'s' : '';
   container.append(makeRow(ts, '🏁', 'END', `${esc(d.reason||'')} | ${turns}t | $${cost} ${dur}`, 'session-end'));
+}
+
+function renderDeathRecord(death, container) {
+  if (!death) return;
+  const ts = death.ts || '';
+  const note = death.note || 'process killed without SessionEnd';
+  const row = makeRow(ts, '💀', 'DEATH', esc(note), 'death-record');
+  row.style.color = 'var(--red)';
+  row.style.fontWeight = '600';
+  container.prepend(row);
 }
 
 function renderSubagentStart(ts, d, container) {
@@ -1718,6 +2052,59 @@ function escAttr(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/* ── JSON syntax highlighting ── */
+
+// JSON syntax highlighter — returns HTML string with colored spans.
+function highlightJson(jsonStr) {
+  return jsonStr.replace(
+    /("(?:[^"\\]|\\.)*")\s*:/g,
+    '<span class="json-key">$1</span>:'
+  ).replace(
+    /:\s*("(?:[^"\\]|\\.)*")/g,
+    ': <span class="json-string">$1</span>'
+  ).replace(
+    /:\s*(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
+    ': <span class="json-number">$1</span>'
+  ).replace(
+    /:\s*(true|false)/g,
+    ': <span class="json-bool">$1</span>'
+  ).replace(
+    /:\s*(null)/g,
+    ': <span class="json-null">$1</span>'
+  );
+}
+
+// Render content with smart formatting:
+//  1. If it's valid JSON → pretty-print + syntax highlight
+//  2. Otherwise → plain escaped text with whitespace preservation
+function formatContent(raw) {
+  if (raw === undefined || raw === null) return '';
+
+  // Normalize: list of content items (Claude API format) → extract text
+  if (Array.isArray(raw)) {
+    raw = raw.map(c => {
+      if (typeof c === 'object' && c !== null && c.text) return c.text;
+      return JSON.stringify(c);
+    }).join('\n');
+  }
+
+  // If it's an object (parsed JSON), stringify it
+  let text = raw;
+  if (typeof raw === 'object') {
+    try { text = JSON.stringify(raw, null, 2); } catch { text = String(raw); }
+  }
+
+  // Try JSON parse + highlight
+  try {
+    const parsed = JSON.parse(text);
+    const pretty = JSON.stringify(parsed, null, 2);
+    return '<pre class="json-block">' + highlightJson(esc(pretty)) + '</pre>';
+  } catch {}
+
+  // Fallback: plain text
+  return esc(text);
 }
 
 function renderMarkdown(el, text, pathHint) {

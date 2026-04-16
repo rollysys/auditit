@@ -30,6 +30,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 AUDIT_DIR = Path.home() / ".claude-audit"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
 REPO_DIR = Path(__file__).resolve().parent
 
@@ -422,12 +423,14 @@ def list_sessions() -> dict:
                 "reason": summary.get("reason", ""),
                 # Inherit mode from root session — a sub-agent of a
                 # scripted run is itself scripted for filtering purposes.
-                "mode": detect_mode(root_env or env),
+                "mode": detect_mode(root_env or env, root_name),
+                "is_headless": (root_env or env).get("is_headless") is True,
             })
         else:
             meta = parent_meta_cache.get(sid, {})
             model = summary.get("model", "") or meta.get("model", "")
             cost = compute_cost(model, summary.get("usage", {}))
+            mode = detect_mode(env, sid)
             sessions.append({
                 "id": sid,
                 "prompt": meta.get("prompt", ""),
@@ -444,7 +447,9 @@ def list_sessions() -> dict:
                 "parent_session_id": "",
                 "root_session_id": sid,
                 "depth": 0,
-                "mode": detect_mode(env),
+                "mode": mode,
+                "is_headless": mode == "scripted",
+                "has_death": (session_dir / "death.json").exists(),
             })
 
     return {"sessions": sessions}
@@ -464,18 +469,38 @@ def _load_meta(session_dir: Path, sid: str) -> dict:
     falls through to the event-based extractor.
     """
     meta_path = session_dir / "metadata.json"
+    cached: dict | None = None
     if meta_path.exists():
         try:
             with open(meta_path) as f:
                 cached = json.load(f)
-            # Only trust the cache if it carries the real metadata,
-            # not just the last_active_at helper fields.
-            if isinstance(cached, dict) and (
-                cached.get("model") or cached.get("prompt") or cached.get("cwd")
-            ):
-                return cached
+            if not isinstance(cached, dict):
+                cached = None
         except (OSError, json.JSONDecodeError):
             pass
+    if cached is not None and (
+        cached.get("model") or cached.get("prompt") or cached.get("cwd")
+    ):
+        # Cache exists and has some real metadata — but it may be incomplete
+        # (e.g. _last_active_iso wrote prompt before _extract_meta_from_events
+        # could fill cwd/started_at/model from a .gz SessionStart). Fill in any
+        # missing core fields from the event stream rather than returning early
+        # with a partial cache.
+        missing = not cached.get("cwd") or not cached.get("started_at")
+        if missing:
+            from_events = _extract_meta_from_events(session_dir, sid)
+            for k in ("model", "cwd", "started_at", "prompt"):
+                if not cached.get(k) and from_events.get(k):
+                    cached[k] = from_events[k]
+            # Persist the merged result
+            try:
+                tmp = meta_path.with_suffix(".json.tmp")
+                with open(tmp, "w") as f:
+                    json.dump(cached, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, meta_path)
+            except OSError:
+                pass
+        return cached
     # Fallback: extract from events (also covers the "only last_active"
     # shell case created by _last_active_iso on a session that has not
     # yet had its real metadata extracted).
@@ -609,17 +634,34 @@ def _load_env(session_dir: Path) -> dict:
         return {}
 
 
-def detect_mode(env: dict | None = None) -> str:
-    """Return "scripted" or "interactive" based on env.json flags.
+def detect_mode(env: dict | None = None, session_id: str = "") -> str:
+    """Return "scripted" or "interactive" based on env.json + transcript.
 
-    Scripted = the parent Claude process was invoked with `-p` / `--print`
-    (headless). Interactive = anything else. Historical sessions without
-    env.json default to "interactive" (most common, and we do not want to
-    hide them retroactively).
+    Primary source: env.json is_headless flag.
+    Fallback: transcript entrypoint == "sdk-cli" means scripted.
+    Historical sessions without either default to "interactive".
     """
     env = env or {}
     if env.get("is_headless") is True:
         return "scripted"
+    # Fallback to transcript entrypoint when env.json lacks is_headless
+    if session_id and "is_headless" not in env:
+        t = _find_transcript(session_id)
+        if t:
+            try:
+                opener = gzip.open if t.name.endswith(".gz") else open
+                with opener(t, "rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        obj = json.loads(line)
+                        if obj.get("entrypoint") == "sdk-cli":
+                            return "scripted"
+                        if obj.get("entrypoint"):
+                            break
+            except Exception:
+                pass
     return "interactive"
 
 
@@ -1033,6 +1075,241 @@ def resolve_session(session_id: str) -> Path | None:
     return None
 
 
+# ── Transcript support ───────────────────────────────────────────────
+#
+# Claude Code writes a full transcript for every session under
+# ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl  (or .jsonl.gz).
+# This is the authoritative record of the conversation: assistant text,
+# thinking, tool calls, tool results, per-message usage, etc.
+#
+# The functions below locate and parse these transcripts, normalizing
+# them into a simple event stream that the frontend can render.
+
+_transcript_cache: dict[str, Path] = {}
+
+
+def _build_usage(raw_usage: dict) -> dict:
+    """Build a flat usage dict from accumulated transcript usage.
+
+    Converts the nested cache_creation dict into flat _5m/_1h fields
+    that compute_cost() expects.
+    """
+    cc = raw_usage.get("cache_creation") or {}
+    if not isinstance(cc, dict):
+        cc = {}
+    return {
+        "input_tokens":                raw_usage.get("input_tokens", 0) or 0,
+        "output_tokens":               raw_usage.get("output_tokens", 0) or 0,
+        "cache_read_input_tokens":     raw_usage.get("cache_read_input_tokens", 0) or 0,
+        "cache_creation_input_tokens": raw_usage.get("cache_creation_input_tokens", 0) or 0,
+        "cache_creation_5m_tokens":    cc.get("ephemeral_5m_input_tokens", 0) or 0,
+        "cache_creation_1h_tokens":    cc.get("ephemeral_1h_input_tokens", 0) or 0,
+    }
+
+
+def _find_transcript(session_id: str) -> Path | None:
+    """Locate the transcript file for a given session_id.
+
+    Searches in order:
+      1. Top-level <session_id>.jsonl/.jsonl.gz under any project dir
+      2. Sub-agent: <any_session>/subagents/agent-<id>.jsonl under any project dir
+         (session_id must start with "agent-")
+    """
+    if session_id in _transcript_cache:
+        p = _transcript_cache[session_id]
+        return p if p.exists() else None
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        # Top-level transcript
+        for suffix in (".jsonl", ".jsonl.gz"):
+            candidate = proj_dir / (session_id + suffix)
+            if candidate.exists():
+                _transcript_cache[session_id] = candidate
+                return candidate
+        # Sub-agent transcript: session_id starts with "agent-"
+        if session_id.startswith("agent-"):
+            for sid_dir in proj_dir.iterdir():
+                if not sid_dir.is_dir():
+                    continue
+                sub_dir = sid_dir / "subagents"
+                if not sub_dir.is_dir():
+                    continue
+                for suffix in (".jsonl", ".jsonl.gz"):
+                    candidate = sub_dir / (session_id + suffix)
+                    if candidate.exists():
+                        _transcript_cache[session_id] = candidate
+                        return candidate
+    return None
+
+
+def read_transcript(session_id: str) -> dict:
+    """Read a Claude transcript and return a dict with events + session meta.
+
+    Returns: {"events": [...], "entrypoint": str, "is_headless": bool,
+              "cwd": str, "first_prompt": str, "model": str, "usage": dict}
+
+    The transcript contains raw Claude API-level messages. We normalize
+    them into a flat event list with types the frontend understands:
+      - {type: "user_text", text, timestamp}
+      - {type: "tool_result", tool_use_id, content, is_error, timestamp}
+      - {type: "assistant_text", text, model, usage, timestamp}
+      - {type: "assistant_thinking", text, model, usage, timestamp}
+      - {type: "assistant_tool_use", name, id, input, model, usage, timestamp}
+    """
+    path = _find_transcript(session_id)
+    if not path:
+        return {}
+
+    # Map tool_use_id → tool name, for enriching tool_result events
+    tool_name_map: dict[str, str] = {}
+
+    events: list = []
+    entrypoint = ""
+    is_headless = False
+    cwd = ""
+    first_prompt = ""
+    model = ""
+    cum_usage: dict = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                           "ephemeral_1h_input_tokens": 0},
+    }
+    seen_msg_ids: set[str] = set()
+
+    opener = gzip.open if path.name.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+
+                # Session-level metadata (from any line that has it)
+                if not entrypoint and obj.get("entrypoint"):
+                    entrypoint = obj["entrypoint"]
+                if not cwd and obj.get("cwd"):
+                    cwd = obj["cwd"]
+
+                # Detect headless: entrypoint=sdk-cli means claude -p
+                t = obj.get("type", "")
+                if t == "queue-operation" and obj.get("operation") == "enqueue":
+                    content = obj.get("content", "")
+                    if not first_prompt and content:
+                        first_prompt = content[:200]
+
+                ts = obj.get("timestamp", "")
+                msg = obj.get("message", {})
+
+                if t == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        if not first_prompt and content and not content.startswith("<local-command"):
+                            first_prompt = content[:200]
+                        events.append({"type": "user_text", "text": content,
+                                       "timestamp": ts})
+                    elif isinstance(content, list):
+                        for item in content:
+                            if not isinstance(item, dict):
+                                continue
+                            it = item.get("type", "")
+                            if it == "text":
+                                text = item.get("text", "")
+                                if not first_prompt and text and not text.startswith("<local-command"):
+                                    first_prompt = text[:200]
+                                events.append({"type": "user_text",
+                                               "text": text,
+                                               "timestamp": ts})
+                            elif it == "tool_result":
+                                tid = item.get("tool_use_id", "")
+                                events.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tid,
+                                    "tool_name": tool_name_map.get(tid, ""),
+                                    "content": item.get("content", ""),
+                                    "is_error": bool(item.get("is_error")),
+                                    "timestamp": ts,
+                                })
+
+                elif t == "assistant":
+                    m = msg.get("model", "")
+                    if m == "<synthetic>":
+                        continue
+                    # Deduplicate
+                    mid = msg.get("id", "")
+                    if mid and mid in seen_msg_ids:
+                        continue
+                    if mid:
+                        seen_msg_ids.add(mid)
+                    if m:
+                        model = m
+                    usage = msg.get("usage", {})
+                    if isinstance(usage, dict):
+                        cum_usage["input_tokens"] += (usage.get("input_tokens", 0) or 0)
+                        cum_usage["output_tokens"] += (usage.get("output_tokens", 0) or 0)
+                        cum_usage["cache_read_input_tokens"] += (usage.get("cache_read_input_tokens", 0) or 0)
+                        cum_usage["cache_creation_input_tokens"] += (usage.get("cache_creation_input_tokens", 0) or 0)
+                        cc = usage.get("cache_creation") or {}
+                        if isinstance(cc, dict):
+                            cum_usage["cache_creation"]["ephemeral_5m_input_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+                            cum_usage["cache_creation"]["ephemeral_1h_input_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+
+                    content = msg.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        it = item.get("type", "")
+                        if it == "text":
+                            events.append({"type": "assistant_text",
+                                           "text": item.get("text", ""),
+                                           "model": m,
+                                           "usage": usage,
+                                           "timestamp": ts})
+                        elif it == "thinking":
+                            events.append({"type": "assistant_thinking",
+                                           "text": item.get("thinking", ""),
+                                           "model": m,
+                                           "usage": usage,
+                                           "timestamp": ts})
+                        elif it == "tool_use":
+                            tid = item.get("id", "")
+                            name = item.get("name", "")
+                            tool_name_map[tid] = name
+                            events.append({
+                                "type": "assistant_tool_use",
+                                "name": name,
+                                "id": tid,
+                                "input": item.get("input", {}),
+                                "model": m,
+                                "usage": usage,
+                                "timestamp": ts,
+                            })
+                # Also detect headless from entrypoint
+                if entrypoint == "sdk-cli":
+                    is_headless = True
+                # Skip: system, file-history-snapshot, attachment, etc.
+    except Exception:
+        pass
+
+    return {
+        "events": events,
+        "entrypoint": entrypoint,
+        "is_headless": is_headless,
+        "cwd": cwd,
+        "first_prompt": first_prompt,
+        "model": model,
+        "usage": cum_usage,
+    }
+
+
 # ── Memory view helpers ──────────────────────────────────────────────
 #
 # The Memory view in the Web UI shows CLAUDE.md-family files for every
@@ -1327,8 +1604,19 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 self._stream_events(parts[3])
         elif path.startswith("/api/sessions/") and path.endswith("/meta"):
             parts = path.split("/")
+            # /api/sessions/<session-id>/meta → 5 parts
             if len(parts) == 5:
                 self._serve_meta(parts[3])
+        elif path.startswith("/api/sessions/") and path.endswith("/transcript"):
+            parts = path.split("/")
+            # /api/sessions/<session-id>/transcript → 5 parts
+            if len(parts) == 5:
+                self._serve_transcript(parts[3])
+        elif path.startswith("/api/sessions/") and path.endswith("/subagents"):
+            parts = path.split("/")
+            # /api/sessions/<session-id>/subagents → 5 parts
+            if len(parts) == 5:
+                self._serve_subagents(parts[3])
         elif path == "/api/memory":
             self._json(build_memory_index())
         elif path == "/api/memory/file":
@@ -1479,6 +1767,80 @@ class AuditHandler(SimpleHTTPRequestHandler):
                 try: fh.close()
                 except Exception: pass
 
+    def _serve_transcript(self, session_id: str):
+        session_id = unquote(session_id)
+        data = read_transcript(session_id)
+        if not data:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self._json(data)
+
+    def _serve_subagents(self, session_id: str):
+        """List sub-agents for a session, combining audit dirs + transcript dirs.
+
+        Returns a list of {id, agent_type, description, source} dicts.
+        source is "audit" (from __agent__ dirs) or "transcript" (from subagents/).
+        """
+        session_id = unquote(session_id)
+        seen: dict[str, dict] = {}
+
+        # Source 1: audit __agent__ dirs
+        if SUBAGENT_SEP in session_id:
+            # This IS a sub-agent; no further nesting
+            self._json([])
+            return
+        prefix = session_id + SUBAGENT_SEP
+        for d in AUDIT_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            if not d.name.startswith(prefix):
+                continue
+            agent_id = d.name[len(prefix):]
+            meta = _load_subagent_meta(d)
+            if agent_id not in seen:
+                seen[agent_id] = {
+                    "id": f"agent-{agent_id}",
+                    "agent_type": (meta or {}).get("agent_type", ""),
+                    "description": (meta or {}).get("description", ""),
+                    "source": "audit",
+                }
+
+        # Source 2: transcript subagents/ dirs
+        for proj_dir in PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            sid_dir = proj_dir / session_id
+            sub_dir = sid_dir / "subagents"
+            if not sub_dir.is_dir():
+                continue
+            for f in sub_dir.iterdir():
+                if not f.name.startswith("agent-") or not f.name.endswith(".jsonl"):
+                    continue
+                agent_id = f.name[6:-6]  # strip "agent-" and ".jsonl"
+                if agent_id in seen:
+                    continue  # audit dir already has it
+                # Read meta.json sibling
+                meta_path = f.with_suffix("").with_suffix(".meta.json")
+                agent_type = ""
+                description = ""
+                if meta_path.exists():
+                    try:
+                        with open(meta_path) as mf:
+                            mj = json.load(mf) or {}
+                        agent_type = mj.get("agentType", "")
+                        description = mj.get("description", "")
+                    except Exception:
+                        pass
+                seen[agent_id] = {
+                    "id": f"agent-{agent_id}",
+                    "agent_type": agent_type,
+                    "description": description,
+                    "source": "transcript",
+                }
+
+        self._json(list(seen.values()))
+
     def _serve_meta(self, session_id: str):
         session_dir = resolve_session(unquote(session_id))
         if not session_dir:
@@ -1487,6 +1849,37 @@ class AuditHandler(SimpleHTTPRequestHandler):
             return
         meta = _load_meta(session_dir, session_id)
         summary = _load_summary(session_dir)
+
+        # Fix buggy old summary.json usage: the old _parse_transcript only
+        # stored the LAST assistant message's usage (not accumulated).
+        # Detect this by checking if output_tokens is suspiciously low
+        # (a multi-turn session always has more than a few hundred output tokens).
+        if summary and session_id:
+            usage = summary.get("usage", {})
+            turns = summary.get("num_turns", 0)
+            out_tok = usage.get("output_tokens", 0)
+            # Heuristic: a session with >2 turns but <1000 output_tokens
+            # almost certainly has the old buggy per-last-msg data.
+            if turns > 2 and 0 < out_tok < 1000:
+                try:
+                    t_data = read_transcript(session_id)
+                    if t_data and t_data.get("events"):
+                        cum = t_data.get("usage", {})
+                        t_model = t_data.get("model", "")
+                        fixed_usage = _build_usage(cum)
+                        if fixed_usage.get("output_tokens", 0) > out_tok:
+                            summary["usage"] = fixed_usage
+                            if t_model:
+                                summary["model"] = t_model
+                            # Persist the corrected data
+                            try:
+                                with open(session_dir / "summary.json", "w") as f:
+                                    json.dump(summary, f, indent=2)
+                            except OSError:
+                                pass
+                except Exception:
+                    pass
+
         # Compute cost + context pressure on the fly so pricing/window
         # updates propagate to historical sessions without rewriting
         # summary.json.
@@ -1495,7 +1888,16 @@ class AuditHandler(SimpleHTTPRequestHandler):
             model = summary.get("model", "") or meta.get("model", "")
             summary["total_cost_usd"] = compute_cost(model, summary.get("usage", {}))
             summary.update(compute_ctx(model, summary.get("ctx_peak_tokens", 0)))
-        self._json({"metadata": meta, "summary": summary})
+        # death.json: written by watchdog when claude is killed (SIGKILL/OOM)
+        death = None
+        death_path = session_dir / "death.json"
+        if death_path.exists():
+            try:
+                with open(death_path) as f:
+                    death = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
+        self._json({"metadata": meta, "summary": summary, "death": death})
 
     def _serve_memory_file(self):
         """GET /api/memory/file?path=<url-encoded abs path>

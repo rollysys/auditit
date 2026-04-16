@@ -26,6 +26,181 @@ from pathlib import Path
 AUDIT_DIR = Path.home() / ".claude-audit"
 
 
+def _find_claude_pid() -> int:
+    """Walk the /proc/ppid chain upward to find the 'claude' process.
+
+    The hook's parent is a zsh shell wrapper; its grandparent is the claude
+    Node.js process. We need the claude PID for proc snapshots and the
+    watchdog. Returns 0 if not found.
+    """
+    pid = os.getpid()
+    for _ in range(10):
+        try:
+            with open("/proc/%d/status" % pid) as f:
+                name = ppid = ""
+                for line in f:
+                    if line.startswith("Name:"):
+                        name = line.split(":", 1)[1].strip()
+                    elif line.startswith("PPid:"):
+                        ppid = line.split(":", 1)[1].strip()
+            if name == "claude":
+                return pid
+            if not ppid or int(ppid) <= 1:
+                break
+            pid = int(ppid)
+        except (OSError, ValueError):
+            break
+    return 0
+
+
+def _snapshot_proc(pid: int) -> dict | None:
+    """Read /proc/<pid>/status + stat and return a lightweight snapshot.
+
+    Returns None on any failure (PID gone, permission denied, etc.).
+    Only reads status (VmRSS, VmSwap, Threads, SigPnd) and stat
+    (utime, stime) — these are O(1) kernel operations with zero
+    side effects. Explicitly avoids smaps_rollup (~6ms for large
+    processes).
+    """
+    if pid <= 0:
+        return None
+    proc: dict = {"pid": pid}
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for line in f:
+                k = line.split(":", 1)[0]
+                if k == "VmRSS":
+                    proc["rss_kb"] = int(line.split(":", 1)[1].strip().split()[0])
+                elif k == "VmSwap":
+                    proc["swap_kb"] = int(line.split(":", 1)[1].strip().split()[0])
+                elif k == "Threads":
+                    proc["threads"] = int(line.split(":", 1)[1].strip())
+                elif k == "SigPnd":
+                    proc["sig_pending"] = line.split(":", 1)[1].strip()
+    except (OSError, ValueError):
+        return None
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().split()
+        proc["utime_ticks"] = int(fields[13])
+        proc["stime_ticks"] = int(fields[14])
+        ticks_per_sec = os.sysconf("SC_CLK_TCK")
+        proc["utime_sec"] = round(int(fields[13]) / ticks_per_sec, 2)
+        proc["stime_sec"] = round(int(fields[14]) / ticks_per_sec, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    # Dedupe: drop keys that are zero/default to keep the event compact
+    for k in ("swap_kb", "sig_pending"):
+        if proc.get(k) in (0, "0000000000000000", "0"):
+            proc.pop(k, None)
+    return proc or None
+
+
+def _spawn_watchdog(session_dir: Path, claude_pid: int) -> None:
+    """Double-fork a lightweight daemon that monitors the claude process.
+
+    On Linux >= 5.3 with os.pidfd_open: uses poll() on the pidfd for
+    zero-overhead, instant detection of process death (including SIGKILL
+    and OOM kill).
+
+    On macOS / older Linux: falls back to polling os.kill(pid, 0) every
+    5 seconds — still reliable but with a small delay.
+
+    When the claude process disappears, writes death.json into the
+    session directory. The daemon exits immediately afterwards.
+
+    Safety: any failure in the watchdog is silently swallowed — it must
+    never interfere with the parent hook or Claude itself.
+    """
+    pid1 = os.fork()
+    if pid1 > 0:
+        # Parent (hook.py): reap the intermediate child and return
+        try:
+            os.waitpid(pid1, 0)
+        except ChildProcessError:
+            pass
+        return
+
+    # ── child_1: new session, second fork ──
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 > 0:
+        os._exit(0)
+
+    # ── child_2: watchdog daemon ──
+    # Close stdio so we don't hold any pipes open
+    try:
+        os.close(0)
+        os.close(1)
+        os.close(2)
+    except OSError:
+        pass
+
+    try:
+        death_path = session_dir / "death.json"
+
+        # If death.json already exists, a previous watchdog beat us — exit.
+        if death_path.exists():
+            os._exit(0)
+
+        # Try pidfd_open (Linux >= 5.3, Python >= 3.9)
+        use_pidfd = hasattr(os, "pidfd_open")
+        pidfd = -1
+        if use_pidfd:
+            try:
+                pidfd = os.pidfd_open(claude_pid)
+            except (OSError, AttributeError):
+                use_pidfd = False
+
+        if use_pidfd and pidfd >= 0:
+            import select
+            poller = select.poll()
+            poller.register(pidfd, select.POLLIN)
+            # Block until PID disappears or 6-hour timeout (safety valve).
+            # Normal exit: SessionEnd hook writes summary.json, then
+            # _cleanup_watchdog removes the flag file and the daemon
+            # exits on the next poll cycle.
+            while True:
+                ready = poller.poll(60_000)  # 1 min check interval
+                # If session has been cleaned up normally, exit quietly.
+                if not (session_dir / ".watchdog").exists():
+                    break
+                if ready:
+                    break
+            os.close(pidfd)
+        else:
+            # Fallback: polling (macOS / old Linux)
+            import time as _time
+            while True:
+                if not (session_dir / ".watchdog").exists():
+                    break
+                try:
+                    os.kill(claude_pid, 0)
+                except OSError:
+                    break
+                _time.sleep(5)
+
+        # If we got here because the PID disappeared (not normal cleanup),
+        # write death.json.
+        if (session_dir / ".watchdog").exists():
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            death = {
+                "ts": ts,
+                "claude_pid": claude_pid,
+                "event": "process_death_detected",
+                "note": "claude process disappeared without SessionEnd — likely SIGKILL, OOM, or crash",
+            }
+            tmp = death_path.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(death, f, indent=2)
+            os.replace(tmp, death_path)
+
+    except Exception:
+        pass
+
+    os._exit(0)
+
+
 def _parse_ts(s):
     if not isinstance(s, str):
         return None
@@ -92,11 +267,15 @@ def _write_env_file(session_dir: Path) -> None:
     used to classify the session as interactive vs scripted (headless).
     claude_code_entrypoint distinguishes SDK vs plain CLI but does not
     by itself tell us interactive vs headless; parent_cmd does.
+
+    claude_pid is the PID of the claude process itself, used by the
+    watchdog and proc snapshot features.
     """
     env_path = session_dir / "env.json"
     if env_path.exists():
         return
     parent_cmd = _parent_cmdline()
+    claude_pid = _find_claude_pid()
     data = {
         "anthropic_base_url":       os.environ.get("ANTHROPIC_BASE_URL", ""),
         "use_bedrock":              os.environ.get("CLAUDE_CODE_USE_BEDROCK", ""),
@@ -104,6 +283,7 @@ def _write_env_file(session_dir: Path) -> None:
         "claude_code_entrypoint":   os.environ.get("CLAUDE_CODE_ENTRYPOINT", ""),
         "parent_cmd":               parent_cmd,
         "is_headless":              _is_headless(parent_cmd),
+        "claude_pid":               claude_pid,
     }
     try:
         with open(env_path, "w") as f:
@@ -116,16 +296,32 @@ def _parse_transcript(transcript_path: str):
     """Walk transcript jsonl and extract model / turns / usage / duration /
     ctx_peak. Skips Claude Code's client-side "<synthetic>" assistant
     messages so the real underlying model is recorded.
+
+    Usage is accumulated across all unique (non-synthetic) assistant
+    messages, deduplicating by message id (Claude Code writes the same
+    assistant message multiple times as it streams).  Each API call is
+    billed independently, so total billed input = sum of per-message
+    input_tokens (which is the full context window at that turn).
     """
     model = ""
-    raw_usage: dict = {}
+    cum_usage: dict = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    cc_cum: dict = {
+        "ephemeral_5m_input_tokens": 0,
+        "ephemeral_1h_input_tokens": 0,
+    }
     num_turns = 0
     first_ts = None
     last_ts = None
     ctx_peak_tokens = 0
+    seen_ids: set[str] = set()
 
     if not transcript_path or not os.path.exists(transcript_path):
-        return model, raw_usage, num_turns, first_ts, last_ts, ctx_peak_tokens
+        return model, cum_usage, num_turns, first_ts, last_ts, ctx_peak_tokens
 
     try:
         with open(transcript_path, encoding="utf-8", errors="replace") as tf:
@@ -152,15 +348,29 @@ def _parse_transcript(transcript_path: str):
                     m = msg.get("model")
                     # Skip Claude Code's client-side synthetic error messages
                     # ("model not found / no access" etc.) entirely — they
-                    # carry an all-zero usage block that would overwrite the
-                    # real cumulative usage.
+                    # carry an all-zero usage block that would pollute totals.
                     if m == "<synthetic>":
                         continue
+                    # Deduplicate: Claude Code writes the same assistant
+                    # message multiple times as it streams tool calls.
+                    mid = msg.get("id", "")
+                    if mid and mid in seen_ids:
+                        continue
+                    if mid:
+                        seen_ids.add(mid)
                     if m:
                         model = m
                     u = msg.get("usage")
                     if isinstance(u, dict):
-                        raw_usage = u
+                        cum_usage["input_tokens"] += (u.get("input_tokens", 0) or 0)
+                        cum_usage["output_tokens"] += (u.get("output_tokens", 0) or 0)
+                        cum_usage["cache_read_input_tokens"] += (u.get("cache_read_input_tokens", 0) or 0)
+                        cum_usage["cache_creation_input_tokens"] += (u.get("cache_creation_input_tokens", 0) or 0)
+                        cc = u.get("cache_creation") or {}
+                        if isinstance(cc, dict):
+                            cc_cum["ephemeral_5m_input_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+                            cc_cum["ephemeral_1h_input_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+                        # ctx_peak: the largest context window seen
                         in_now = (
                             (u.get("input_tokens", 0) or 0)
                             + (u.get("cache_read_input_tokens", 0) or 0)
@@ -171,7 +381,10 @@ def _parse_transcript(transcript_path: str):
     except OSError:
         pass
 
-    return model, raw_usage, num_turns, first_ts, last_ts, ctx_peak_tokens
+    # Merge cache_creation breakdown into cum_usage
+    cum_usage["cache_creation"] = cc_cum
+
+    return model, cum_usage, num_turns, first_ts, last_ts, ctx_peak_tokens
 
 
 def _build_usage(raw_usage: dict) -> dict:
@@ -186,6 +399,47 @@ def _build_usage(raw_usage: dict) -> dict:
         "cache_creation_5m_tokens":    cc.get("ephemeral_5m_input_tokens", 0) or 0,
         "cache_creation_1h_tokens":    cc.get("ephemeral_1h_input_tokens", 0) or 0,
     }
+
+
+def _backfill_usage(session_dir: Path) -> None:
+    """Re-parse transcript to fix summary.json usage for existing sessions.
+
+    Called on SessionEnd when the old summary.json has the buggy per-last-msg
+    usage instead of the correct accumulated totals.  Also used by the
+    /api/sessions/<sid>/meta endpoint to serve correct cost data.
+    """
+    # Find transcript path from env.json or search
+    sid = session_dir.name
+    transcript_path = ""
+    env_path = session_dir / "env.json"
+    if env_path.exists():
+        try:
+            with open(env_path) as f:
+                env = json.load(f)
+            transcript_path = env.get("transcript_path", "")
+        except Exception:
+            pass
+    if not transcript_path or not os.path.exists(transcript_path):
+        return
+    model, cum_usage, num_turns, first_ts, last_ts, ctx_peak = _parse_transcript(transcript_path)
+    usage = _build_usage(cum_usage)
+    # Only update if the new usage has more output_tokens (indicates old buggy data)
+    summary_path = session_dir / "summary.json"
+    if not summary_path.exists():
+        return
+    try:
+        with open(summary_path) as f:
+            old = json.load(f)
+        old_usage = old.get("usage", {})
+        if usage.get("output_tokens", 0) > old_usage.get("output_tokens", 0):
+            old["usage"] = usage
+            if model:
+                old["model"] = model
+            old["ctx_peak_tokens"] = ctx_peak
+            with open(summary_path, "w") as f:
+                json.dump(old, f, indent=2)
+    except Exception:
+        pass
 
 
 def _atomic_gzip(jsonl_path: Path) -> bool:
@@ -541,15 +795,39 @@ def _main():
 
     _write_env_file(session_dir)
 
+    # Snapshot claude process runtime info (RSS, CPU, signals) from /proc.
+    # Attached as a "proc" sidecar field — zero-overhead read (~0.03ms).
+    proc_snap = _snapshot_proc(_find_claude_pid())
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    line = '{"ts":"' + ts + '","event":"' + event + '","data":' + raw + '}\n'
+    line = '{"ts":"' + ts + '","event":"' + event + '","data":' + raw
+    if proc_snap:
+        line += ',"proc":' + json.dumps(proc_snap)
+    line += '}\n'
     try:
         with open(session_dir / "audit.jsonl", "a") as f:
             f.write(line)
     except OSError:
         pass
 
+    if event == "SessionStart":
+        # Spawn watchdog daemon to detect SIGKILL / OOM kill.
+        # Writes .watchdog flag file so the daemon knows it's still needed;
+        # SessionEnd removes it for a clean shutdown.
+        claude_pid = _find_claude_pid()
+        if claude_pid > 0:
+            try:
+                (session_dir / ".watchdog").write_text(str(claude_pid))
+            except OSError:
+                pass
+            _spawn_watchdog(session_dir, claude_pid)
+
     if event == "SessionEnd":
+        # Signal the watchdog that this is a normal exit, not a crash.
+        try:
+            (session_dir / ".watchdog").unlink()
+        except OSError:
+            pass
         _handle_session_end(session_dir, data)
 
 
