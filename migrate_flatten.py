@@ -317,6 +317,129 @@ def dedupe_flat(audit_dir: Path, dry_run: bool) -> int:
     return 0
 
 
+# ── Scripted-prompt patterns ─────────────────────────────────────────
+#
+# Historical sessions were recorded before hook.py captured parent_cmd,
+# so we cannot determine is_headless from env directly. Instead we match
+# the first UserPromptSubmit's prompt text against high-precision
+# markers that only appear in automated / scripted invocations.
+#
+# All patterns are DIRECT substring matches (case-sensitive). Keep them
+# specific; false positives retroactively hide real conversations from
+# the default view. The UI toggle recovers them but still: be conservative.
+SCRIPTED_PROMPT_MARKERS: tuple[str, ...] = (
+    "自动化流水线任务",
+    "重要：这是自动化",
+    "重要：直接执行",
+    "直接执行，不需要确认",
+    "你是 AA-",
+    "你是估值分析 agent",
+    "你是情景分析",
+    "你是研究问题生成器",
+    "你是一个金融研究 sub-agent",
+)
+
+
+def _first_user_prompt(session_dir: Path) -> str:
+    """Return the first UserPromptSubmit's prompt text; '' if not found."""
+    for name in ("audit.jsonl", "audit.jsonl.gz"):
+        p = session_dir / name
+        if not p.exists():
+            continue
+        opener = gzip.open if name.endswith(".gz") else open
+        try:
+            with opener(p, "rt", encoding="utf-8", errors="replace") as f:
+                for L in f:
+                    if not L.strip():
+                        continue
+                    try:
+                        o = json.loads(L)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if o.get("event") == "UserPromptSubmit":
+                        return (o.get("data", {}) or {}).get("prompt", "") or ""
+        except OSError:
+            continue
+    return ""
+
+
+def _matches_scripted(prompt: str) -> str:
+    """Return the matching marker string, or '' if no match."""
+    if not prompt:
+        return ""
+    for m in SCRIPTED_PROMPT_MARKERS:
+        if m in prompt:
+            return m
+    return ""
+
+
+def backfill_mode(audit_dir: Path, dry_run: bool) -> int:
+    """Mark historical scripted sessions via prompt-pattern inference.
+
+    For each flat session dir without a live is_headless signal, read
+    the first UserPromptSubmit and check for known scripted markers.
+    On match, write is_headless=true into env.json plus a _backfill_source
+    / _backfill_marker trail for audit.
+
+    Live signals (is_headless written by hook.py from parent_cmd) always
+    win over retroactive inference — those sessions are skipped.
+    Idempotent.
+    """
+    marked = 0
+    scanned = 0
+    already = 0
+    skipped = 0
+    for sd in sorted(audit_dir.iterdir()):
+        if not sd.is_dir():
+            continue
+        name = sd.name
+        if name.startswith("_") or name.startswith("."):
+            continue
+        if is_date_dir(name):
+            continue
+        if "__agent__" in name:
+            # Sub-agents inherit from their root; do not classify
+            # independently.
+            continue
+        scanned += 1
+        env_path = sd / "env.json"
+        env_cur: dict = {}
+        if env_path.exists():
+            try:
+                with open(env_path) as f:
+                    env_cur = json.load(f) or {}
+            except (OSError, json.JSONDecodeError):
+                env_cur = {}
+        # Live signal wins; never overwrite a hook-captured classification.
+        if "is_headless" in env_cur and "_backfill_source" not in env_cur:
+            already += 1
+            continue
+        prompt = _first_user_prompt(sd)
+        marker = _matches_scripted(prompt)
+        if not marker:
+            skipped += 1
+            continue
+        marked += 1
+        compact_prompt = prompt[:60].replace("\n", " ")
+        print(f"  {name[:8]}…  ← {marker!r}  prompt[:60]={compact_prompt!r}")
+        if dry_run:
+            continue
+        env_cur["is_headless"] = True
+        env_cur["_backfill_source"] = "prompt-pattern"
+        env_cur["_backfill_marker"] = marker
+        try:
+            tmp = env_path.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(env_cur, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, env_path)
+        except OSError as e:
+            print(f"    FAIL writing env.json: {e}")
+
+    print()
+    print(f"  scanned {scanned}; newly marked {marked}; already had signal {already}; no-match {skipped}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Flatten ~/.claude-audit/ layout (date-partitioned → flat)")
     ap.add_argument("--audit-dir", default=str(Path.home() / ".claude-audit"),
@@ -324,6 +447,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="Show plan without writing")
     ap.add_argument("--dedupe-flat", action="store_true",
                     help="Walk existing flat dirs and dedupe their audit logs (no migration)")
+    ap.add_argument("--backfill-mode", action="store_true",
+                    help="Classify historical sessions as scripted via prompt pattern match; "
+                         "writes is_headless=true into env.json for matches. Never overrides "
+                         "a live signal.")
     args = ap.parse_args()
 
     audit_dir = Path(args.audit_dir).expanduser().resolve()
@@ -336,6 +463,12 @@ def main() -> int:
         if args.dry_run:
             print("(dry-run — no files will be written)")
         return dedupe_flat(audit_dir, args.dry_run)
+
+    if args.backfill_mode:
+        print(f"backfill-mode: inferring is_headless from prompt patterns under {audit_dir}")
+        if args.dry_run:
+            print("(dry-run — no files will be written)")
+        return backfill_mode(audit_dir, args.dry_run)
 
     by_sid = discover(audit_dir)
     if not by_sid:
