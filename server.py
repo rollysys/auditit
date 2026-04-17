@@ -773,6 +773,7 @@ def list_sessions() -> dict:
                 except (ValueError, TypeError):
                     pass
 
+            full_usage = header.get("usage", {}) or {}
             sessions_by_id[sid] = {
                 "id": sid,
                 "prompt": header.get("first_prompt", ""),
@@ -792,6 +793,14 @@ def list_sessions() -> dict:
                 "mode": mode,
                 "is_headless": is_headless,
                 "project": proj_name,
+                "input_tokens": int(full_usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(full_usage.get("output_tokens", 0) or 0),
+                "cache_read_tokens": int(full_usage.get("cache_read_input_tokens", 0) or 0),
+                "cache_creation_tokens": int(
+                    (full_usage.get("cache_creation_input_tokens", 0) or 0)
+                    or ((full_usage.get("cache_creation_5m_tokens", 0) or 0)
+                        + (full_usage.get("cache_creation_1h_tokens", 0) or 0))
+                ),
             }
 
     _session_index_cache = sessions_by_id
@@ -1142,8 +1151,17 @@ def build_stats(exclude_scripted: bool = False,
         started_at = s.get("started_at", "") or s.get("last_active_at", "")
         date_bucket = started_at[:10] or "unknown"
 
+        inp = s.get("input_tokens", 0) or 0
+        out = s.get("output_tokens", 0) or 0
+        cr  = s.get("cache_read_tokens", 0) or 0
+        cw  = s.get("cache_creation_tokens", 0) or 0
+
         totals["sessions"] += 1
         totals["cost"] += window_cost
+        totals["input_tokens"] += inp
+        totals["output_tokens"] += out
+        totals["cache_read_tokens"] += cr
+        totals["cache_creation_tokens"] += cw
         totals["duration_ms"] += dur
         totals["turns"] += turns
 
@@ -1155,6 +1173,10 @@ def build_stats(exclude_scripted: bool = False,
         })
         bm["sessions"] += 1
         bm["cost"] += window_cost
+        bm["input_tokens"] += inp
+        bm["output_tokens"] += out
+        bm["cache_read_tokens"] += cr
+        bm["cache_creation_tokens"] += cw
         bm["turns"] += turns
         bm["duration_ms"] += dur
 
@@ -1166,6 +1188,10 @@ def build_stats(exclude_scripted: bool = False,
         })
         bp["sessions"] += 1
         bp["cost"] += window_cost
+        bp["input_tokens"] += inp
+        bp["output_tokens"] += out
+        bp["cache_read_tokens"] += cr
+        bp["cache_creation_tokens"] += cw
         bp["turns"] += turns
         bp["duration_ms"] += dur
 
