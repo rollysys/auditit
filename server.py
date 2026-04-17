@@ -1085,7 +1085,19 @@ def resolve_session(session_id: str) -> Path | None:
 # The functions below locate and parse these transcripts, normalizing
 # them into a simple event stream that the frontend can render.
 
-_transcript_cache: dict[str, Path] = {}
+_transcript_cache: dict[str, tuple[Path, float]] = {}  # sid → (path, cache_time)
+_TRANSCRIPT_CACHE_TTL = 60.0  # seconds before a cache entry is re-verified
+
+
+def _validate_session_id(session_id: str) -> bool:
+    """Reject session_ids that could cause path traversal or shenanigans."""
+    if not session_id:
+        return False
+    if "/" in session_id or "\\" in session_id or "\x00" in session_id:
+        return False
+    if ".." in session_id:
+        return False
+    return True
 
 
 def _build_usage(raw_usage: dict) -> dict:
@@ -1114,19 +1126,40 @@ def _find_transcript(session_id: str) -> Path | None:
       1. Top-level <session_id>.jsonl/.jsonl.gz under any project dir
       2. Sub-agent: <any_session>/subagents/agent-<id>.jsonl under any project dir
          (session_id must start with "agent-")
+
+    Security: session_id is validated to prevent path traversal (no "/",
+    "..", or null bytes). The resolved candidate is checked to stay under
+    PROJECTS_DIR as defense-in-depth.
+
+    Caching: results are cached for TRANSCRIPT_CACHE_TTL seconds. Cache
+    entries whose file has been deleted/moved are evicted on access.
     """
+    if not _validate_session_id(session_id):
+        return None
+
+    now = time.time()
     if session_id in _transcript_cache:
-        p = _transcript_cache[session_id]
-        return p if p.exists() else None
+        p, cached_at = _transcript_cache[session_id]
+        if (now - cached_at) < _TRANSCRIPT_CACHE_TTL and p.exists():
+            return p
+        del _transcript_cache[session_id]
+
+    projects_resolved = PROJECTS_DIR.resolve()
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
         # Top-level transcript
         for suffix in (".jsonl", ".jsonl.gz"):
             candidate = proj_dir / (session_id + suffix)
-            if candidate.exists():
-                _transcript_cache[session_id] = candidate
-                return candidate
+            if not candidate.exists():
+                continue
+            # Defense-in-depth: must stay under PROJECTS_DIR
+            try:
+                candidate.resolve().relative_to(projects_resolved)
+            except ValueError:
+                continue
+            _transcript_cache[session_id] = (candidate, now)
+            return candidate
         # Sub-agent transcript: session_id starts with "agent-"
         if session_id.startswith("agent-"):
             for sid_dir in proj_dir.iterdir():
@@ -1137,9 +1170,14 @@ def _find_transcript(session_id: str) -> Path | None:
                     continue
                 for suffix in (".jsonl", ".jsonl.gz"):
                     candidate = sub_dir / (session_id + suffix)
-                    if candidate.exists():
-                        _transcript_cache[session_id] = candidate
-                        return candidate
+                    if not candidate.exists():
+                        continue
+                    try:
+                        candidate.resolve().relative_to(projects_resolved)
+                    except ValueError:
+                        continue
+                    _transcript_cache[session_id] = (candidate, now)
+                    return candidate
     return None
 
 
@@ -1292,12 +1330,20 @@ def read_transcript(session_id: str) -> dict:
                                 "usage": usage,
                                 "timestamp": ts,
                             })
-                # Also detect headless from entrypoint
-                if entrypoint == "sdk-cli":
-                    is_headless = True
                 # Skip: system, file-history-snapshot, attachment, etc.
-    except Exception:
-        pass
+    except Exception as exc:
+        import traceback
+        try:
+            with open(AUDIT_DIR / "_server_errors.log", "a") as ef:
+                ef.write(f"read_transcript({session_id}): {type(exc).__name__}: {exc}\n")
+                traceback.print_exc(file=ef)
+        except OSError:
+            pass
+
+    # Detect headless from entrypoint — done ONCE after parsing, not
+    # inside the per-line loop where it was previously misplaced.
+    if entrypoint == "sdk-cli":
+        is_headless = True
 
     return {
         "events": events,
@@ -1852,14 +1898,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
 
         # Fix buggy old summary.json usage: the old _parse_transcript only
         # stored the LAST assistant message's usage (not accumulated).
-        # Detect this by checking if output_tokens is suspiciously low
-        # (a multi-turn session always has more than a few hundred output tokens).
+        # Detect this by checking if output_tokens is suspiciously low.
+        # We correct IN MEMORY only (never write back to summary.json —
+        # audit data is immutable). The corrected values are returned to
+        # the client for display but the on-disk file stays untouched.
         if summary and session_id:
             usage = summary.get("usage", {})
             turns = summary.get("num_turns", 0)
             out_tok = usage.get("output_tokens", 0)
-            # Heuristic: a session with >2 turns but <1000 output_tokens
-            # almost certainly has the old buggy per-last-msg data.
             if turns > 2 and 0 < out_tok < 1000:
                 try:
                     t_data = read_transcript(session_id)
@@ -1868,15 +1914,10 @@ class AuditHandler(SimpleHTTPRequestHandler):
                         t_model = t_data.get("model", "")
                         fixed_usage = _build_usage(cum)
                         if fixed_usage.get("output_tokens", 0) > out_tok:
+                            summary = dict(summary)
                             summary["usage"] = fixed_usage
                             if t_model:
                                 summary["model"] = t_model
-                            # Persist the corrected data
-                            try:
-                                with open(session_dir / "summary.json", "w") as f:
-                                    json.dump(summary, f, indent=2)
-                            except OSError:
-                                pass
                 except Exception:
                     pass
 
