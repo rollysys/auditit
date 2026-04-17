@@ -1829,13 +1829,8 @@ function renderDashboard(s) {
   // day (last 30d) / week (last 12w). Chart redraws without refetching.
   html += '<div class="dash-charts-wide">';
   html += '<div class="dash-chart-box">';
-  html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">';
-  html += '<h4 style="margin:0">Cost trend</h4>';
-  html += '<div class="dash-granularity-tabs">';
-  html += '<button data-gran="hour">Hour · 72h</button>';
-  html += '<button data-gran="day" class="active">Day · 30d</button>';
-  html += '<button data-gran="week">Week · 12w</button>';
-  html += '</div></div>';
+  html += '<div class="dash-chart-box">';
+  html += '<h4>Cost trend</h4>';
   html += '<div class="dash-chart-canvas"><canvas id="chartCostTrend"></canvas></div>';
   html += '</div></div>';
 
@@ -1950,17 +1945,10 @@ function renderDashboard(s) {
   // Render charts after DOM is in place
   _drawProviderCostChart(s.by_provider);
   _drawModelCostChart(s.by_model);
-  _drawCostTrend(s, 'day');
-
-  // Granularity tab clicks. Re-draw the trend chart without refetching
-  // since all three series are already in the stats payload.
-  panel.querySelectorAll('.dash-granularity-tabs button').forEach(btn => {
-    btn.addEventListener('click', () => {
-      panel.querySelectorAll('.dash-granularity-tabs button').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      _drawCostTrend(s, btn.dataset.gran);
-    });
-  });
+  // Auto-pick chart granularity based on the global range selector
+  const range = document.getElementById('dashRangeSelect')?.value || 'all';
+  const autoGran = range === '1d' ? 'hour' : (range === '7d' ? 'day' : 'day');
+  _drawCostTrend(s, autoGran);
 }
 
 const PROVIDER_COLORS = {
