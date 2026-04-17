@@ -1020,11 +1020,13 @@ def build_stats(exclude_scripted: bool = False,
         if exclude_scripted and s.get("mode") == "scripted":
             continue
 
-        # Time range filter — applies to ALL aggregates uniformly
-        started_at = s.get("started_at", "") or s.get("last_active_at", "")
-        if cutoff_dt and started_at:
-            s_dt = _parse_ts(started_at)
-            if s_dt and s_dt < cutoff_dt:
+        # Time range filter — uses last_active_at so long-running sessions
+        # that are still active within the window are included. A session
+        # started 5 days ago but active today should appear in "Last 24h".
+        last_active = s.get("last_active_at", "") or s.get("started_at", "")
+        if cutoff_dt and last_active:
+            la_dt = _parse_ts(last_active)
+            if la_dt and la_dt < cutoff_dt:
                 continue
 
         model = s.get("model", "") or "unknown"
@@ -1033,6 +1035,7 @@ def build_stats(exclude_scripted: bool = False,
         turns = s.get("turns", 0) or 0
         provider = detect_provider(model)
 
+        started_at = s.get("started_at", "") or s.get("last_active_at", "")
         date_bucket = started_at[:10] or "unknown"
         calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
 
