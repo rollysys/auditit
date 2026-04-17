@@ -488,11 +488,18 @@ def list_sessions() -> dict:
     if not PROJECTS_DIR.exists():
         return {"sessions": []}
 
+    # Project dirs to skip: "memory" is Claude's auto-memory store, and
+    # plugin-internal project dirs (e.g. claude-mem observer daemon sessions)
+    # are not real user sessions.
+    SKIP_PROJECT_PATTERNS = ("memory", "observer-session", "claude-mem")
+
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
         proj_name = proj_dir.name
-        if proj_name == "memory" or proj_name.startswith("."):
+        if proj_name.startswith("."):
+            continue
+        if any(pat in proj_name for pat in SKIP_PROJECT_PATTERNS):
             continue
         for f in proj_dir.iterdir():
             if f.is_dir():
