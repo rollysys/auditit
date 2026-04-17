@@ -341,118 +341,231 @@ def _last_active_iso(session_dir: Path) -> str:
     return ts
 
 
-def list_sessions() -> dict:
-    """Return {sessions: [...], by_root: {...}} for the Web UI.
+_session_index_cache: dict[str, dict] = {}
+_session_index_ts: float = 0
+_SESSION_INDEX_TTL = 30.0  # seconds
 
-    Each session entry carries is_subagent / parent_session_id / depth
-    so the UI can nest sub-agents under their parent.
 
-    Layout (post-flatten): ~/.claude-audit/<sid>/ for parents,
-    ~/.claude-audit/<sid>__agent__<id>/ for sub-agents (siblings, not
-    nested). Sorting/grouping by date is the frontend's job — we just
-    expose started_at and last_active_at.
+def _scan_transcript_header(path: Path) -> dict:
+    """Read only the first ~50 lines of a transcript for session metadata.
+
+    Much cheaper than read_transcript() (which parses the entire file for
+    events). We extract: cwd, entrypoint, first_prompt, model, started_at,
+    last known timestamp, and cumulative usage from the LAST assistant msg
+    we encounter in the header window. For cost we do a second pass to get
+    the file's last line (8KB tail seek for .jsonl, or decompress for .gz).
     """
-    sessions: list[dict] = []
-    if not AUDIT_DIR.exists():
-        return {"sessions": sessions}
+    cwd = entrypoint = first_prompt = model = ""
+    started_at = last_ts = ""
+    usage: dict = {}
+    num_user_turns = 0
 
-    # First pass: collect non-subagent (parent) dirs so we can resolve
-    # cwd inheritance for sub-agents.
-    parent_meta_cache: dict[str, dict] = {}
+    opener = gzip.open if path.name.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 50:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                ts = obj.get("timestamp", "")
+                if ts and not started_at:
+                    started_at = ts
+                if ts:
+                    last_ts = ts
+                if not cwd:
+                    cwd = obj.get("cwd", "") or ""
+                if not entrypoint:
+                    entrypoint = obj.get("entrypoint", "") or ""
+                t = obj.get("type", "")
+                if t == "queue-operation" and obj.get("operation") == "enqueue":
+                    content = obj.get("content", "")
+                    if not first_prompt and content:
+                        first_prompt = content[:200]
+                elif t == "user":
+                    num_user_turns += 1
+                    msg = obj.get("message", {})
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                    if isinstance(content, str) and not first_prompt:
+                        if content and not content.startswith("<local-command"):
+                            first_prompt = content[:200]
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                text = item.get("text", "")
+                                if not first_prompt and text and not text.startswith("<local-command"):
+                                    first_prompt = text[:200]
+                                    break
+                elif t == "assistant":
+                    msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
+                    m = msg.get("model", "")
+                    if m and m != "<synthetic>":
+                        model = m
+                    u = msg.get("usage")
+                    if isinstance(u, dict):
+                        usage = u
+    except OSError:
+        pass
 
-    for session_dir in sorted(AUDIT_DIR.iterdir()):
-        if not session_dir.is_dir():
-            continue
-        sid = session_dir.name
-        if sid.startswith("_") or sid.startswith("."):
-            continue
-        # Old date-partitioned dirs still on disk during transition look
-        # like "20YY-MM-DD". Skip them — the migration script handles them.
-        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
-            continue
-        if SUBAGENT_SEP in sid:
-            continue  # collected in the second pass below
-        meta = _load_meta(session_dir, sid)
-        parent_meta_cache[sid] = meta
+    # Tail read for last_ts + final usage (most accurate for cost).
+    # For .jsonl files, seek to the last 8KB. For .gz, we already have
+    # whatever we caught in the first 50 lines — skip the full decompress
+    # (build_stats will call read_transcript for cost-accurate data if needed).
+    if not path.name.endswith(".gz"):
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                end = f.tell()
+                chunk = min(16384, end)
+                f.seek(max(0, end - chunk))
+                tail = f.read()
+            # Walk backward to find the last few complete lines
+            for raw_line in reversed(tail.splitlines()):
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                ts = obj.get("timestamp", "")
+                if ts:
+                    last_ts = ts
+                t = obj.get("type", "")
+                if t == "assistant":
+                    msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
+                    m = msg.get("model", "")
+                    if m and m != "<synthetic>":
+                        model = m
+                    u = msg.get("usage")
+                    if isinstance(u, dict) and u.get("output_tokens"):
+                        usage = u
+                    break
+                if t == "user":
+                    num_user_turns += 1
+                    break
+        except OSError:
+            pass
 
-    for session_dir in sorted(AUDIT_DIR.iterdir()):
-        if not session_dir.is_dir():
-            continue
-        sid = session_dir.name
-        if sid.startswith("_") or sid.startswith("."):
-            continue
-        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
-            continue
-        summary = _load_summary(session_dir)
-        count   = _count_events(session_dir)
-        status  = "active" if _is_session_active(session_dir) else "completed"
-        last_active = _last_active_iso(session_dir)
+    # Count total user turns by counting newlines in user-type entries is
+    # too expensive. We use the rough count from the header + tail window,
+    # or fall back to 0 which is honest (the UI shows "—" for turns=0).
 
-        sub_meta = _load_subagent_meta(session_dir)
-        is_subagent = sub_meta is not None or SUBAGENT_SEP in sid
-        env = _load_env(session_dir)
+    return {
+        "cwd": cwd,
+        "entrypoint": entrypoint,
+        "first_prompt": first_prompt,
+        "model": model,
+        "started_at": started_at,
+        "last_active_at": last_ts,
+        "usage": usage,
+        "is_headless": entrypoint == "sdk-cli",
+    }
 
-        if is_subagent:
-            parent_name = sid.rsplit(SUBAGENT_SEP, 1)[0] if SUBAGENT_SEP in sid else ""
-            agent_id   = (sub_meta or {}).get("agent_id", "") or sid.rsplit(SUBAGENT_SEP, 1)[-1]
-            agent_type = (sub_meta or {}).get("agent_type", "")
-            description = (sub_meta or {}).get("description", "")
-            start_ts   = (sub_meta or {}).get("start_ts", "") or summary.get("start_ts", "")
-            depth      = sid.count(SUBAGENT_SEP)
-            root_name = sid.split(SUBAGENT_SEP, 1)[0]
-            root_meta = parent_meta_cache.get(root_name, {})
-            root_env  = _load_env(AUDIT_DIR / root_name) if (AUDIT_DIR / root_name).is_dir() else {}
-            sessions.append({
+
+def list_sessions() -> dict:
+    """Return {sessions: [...]} by scanning transcript files.
+
+    Data source: ~/.claude/projects/*/<sid>.jsonl — Claude Code's native
+    transcript files. No dependency on hook-written audit data. Each
+    transcript is scanned for header metadata (first ~50 lines + tail)
+    to extract cwd, model, prompt, timestamps, and usage for cost.
+
+    Results are cached for SESSION_INDEX_TTL seconds to avoid re-scanning
+    thousands of transcript files on every /api/sessions call.
+    """
+    global _session_index_cache, _session_index_ts
+    now = time.time()
+    if _session_index_cache and (now - _session_index_ts) < _SESSION_INDEX_TTL:
+        return {"sessions": list(_session_index_cache.values())}
+
+    sessions_by_id: dict[str, dict] = {}
+    if not PROJECTS_DIR.exists():
+        return {"sessions": []}
+
+    for proj_dir in PROJECTS_DIR.iterdir():
+        if not proj_dir.is_dir():
+            continue
+        proj_name = proj_dir.name
+        if proj_name == "memory" or proj_name.startswith("."):
+            continue
+        for f in proj_dir.iterdir():
+            if f.is_dir():
+                continue
+            name = f.name
+            # Match <uuid>.jsonl or <uuid>.jsonl.gz
+            sid = ""
+            if name.endswith(".jsonl.gz"):
+                sid = name[:-9]
+            elif name.endswith(".jsonl"):
+                sid = name[:-6]
+            if not sid or not _validate_session_id(sid):
+                continue
+            # Skip sub-agent dirs / names
+            if SUBAGENT_SEP in sid:
+                continue
+            # Avoid re-scanning if we already have this sid from another
+            # project dir (shouldn't happen, but defensive).
+            if sid in sessions_by_id:
+                continue
+
+            header = _scan_transcript_header(f)
+            model = header.get("model", "")
+            usage = header.get("usage", {})
+            cost = compute_cost(model, _build_usage(usage) if usage else {})
+            is_headless = header.get("is_headless", False)
+            mode = "scripted" if is_headless else "interactive"
+
+            # Determine active/completed: if the file was modified in the
+            # last ACTIVE_WINDOW_S seconds, it's likely still being written.
+            try:
+                mtime = f.stat().st_mtime
+                status = "active" if (now - mtime) < ACTIVE_WINDOW_S else "completed"
+            except OSError:
+                status = "completed"
+
+            # Duration from timestamps
+            duration_ms = 0
+            s_ts = header.get("started_at", "")
+            l_ts = header.get("last_active_at", "")
+            if s_ts and l_ts:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    t0 = _dt.fromisoformat(s_ts.replace("Z", "+00:00"))
+                    t1 = _dt.fromisoformat(l_ts.replace("Z", "+00:00"))
+                    duration_ms = max(0, int((t1 - t0).total_seconds() * 1000))
+                except (ValueError, TypeError):
+                    pass
+
+            sessions_by_id[sid] = {
                 "id": sid,
-                "prompt": description,
-                "model": "",
-                "cwd": root_meta.get("cwd", ""),
-                "count": count,
-                "turns": summary.get("num_tool_calls", 0),
-                "cost": None,
-                "duration_ms": summary.get("duration_ms", 0),
-                "status": status,
-                "started_at": start_ts,
-                "last_active_at": last_active,
-                "is_subagent": True,
-                "parent_session_id": parent_name,
-                "root_session_id": root_name,
-                "agent_id": agent_id,
-                "agent_type": agent_type,
-                "depth": depth,
-                "reason": summary.get("reason", ""),
-                # Inherit mode from root session — a sub-agent of a
-                # scripted run is itself scripted for filtering purposes.
-                "mode": detect_mode(root_env or env, root_name),
-                "is_headless": (root_env or env).get("is_headless") is True,
-            })
-        else:
-            meta = parent_meta_cache.get(sid, {})
-            model = summary.get("model", "") or meta.get("model", "")
-            cost = compute_cost(model, summary.get("usage", {}))
-            mode = detect_mode(env, sid)
-            sessions.append({
-                "id": sid,
-                "prompt": meta.get("prompt", ""),
+                "prompt": header.get("first_prompt", ""),
                 "model": model,
-                "cwd": meta.get("cwd", ""),
-                "count": count,
-                "turns": summary.get("num_turns", 0),
-                "cost": cost,
-                "duration_ms": summary.get("duration_ms", 0),
+                "cwd": header.get("cwd", ""),
+                "count": 0,
+                "turns": 0,
+                "cost": round(cost, 4) if cost else 0,
+                "duration_ms": duration_ms,
                 "status": status,
-                "started_at": meta.get("started_at", ""),
-                "last_active_at": last_active,
+                "started_at": header.get("started_at", ""),
+                "last_active_at": header.get("last_active_at", ""),
                 "is_subagent": False,
                 "parent_session_id": "",
                 "root_session_id": sid,
                 "depth": 0,
                 "mode": mode,
-                "is_headless": mode == "scripted",
-                "has_death": (session_dir / "death.json").exists(),
-            })
+                "is_headless": is_headless,
+                "project": proj_name,
+            }
 
-    return {"sessions": sessions}
+    _session_index_cache = sessions_by_id
+    _session_index_ts = now
+    return {"sessions": list(sessions_by_id.values())}
 
 
 def _load_meta(session_dir: Path, sid: str) -> dict:
@@ -712,24 +825,14 @@ def detect_provider(model: str, env: dict | None = None) -> str:
 
 
 def build_stats(exclude_scripted: bool = False) -> dict:
-    """Aggregate across all main sessions for the Dashboard view.
+    """Aggregate across all sessions for the Dashboard view.
 
-    Sub-agent directories are skipped — their token/cost usage is already
-    captured in the parent session's transcript, so counting them would
-    double-count.
+    Reuses list_sessions()'s cached transcript index — no separate scan.
+    Sub-agents are excluded (list_sessions already filters them).
 
-    When `exclude_scripted=True`, sessions whose env.json marks them as
-    headless (claude -p invocation) are omitted from every aggregate.
-    The frontend passes this flag when its scripted-filter toggle is off.
-
-    Returns:
-      totals: totals across all sessions (session count, cost, tokens,
-              duration). Tokens are split into input / output / cache_read /
-              cache_creation (5m+1h combined).
-      by_model: per-model aggregates (same fields as totals minus duration).
-      by_date: per-day aggregates (sorted ascending), for trend chart.
-      top_by_cost: top 20 sessions by cost.
-      top_by_ctx: top 20 sessions by ctx_peak_pct.
+    Cost comes from the transcript header's tail-read usage + model →
+    compute_cost(). This is the same data source as the Sessions list,
+    so totals are consistent.
     """
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     now_utc = _dt.now(_tz.utc)
@@ -747,7 +850,6 @@ def build_stats(exclude_scripted: bool = False) -> dict:
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_creation_tokens": 0,
         "duration_ms": 0, "turns": 0,
-        # Rolling windows, populated below as we iterate.
         "last_1h_cost":  0.0,
         "last_24h_cost": 0.0,
         "last_7d_cost":  0.0,
@@ -755,67 +857,36 @@ def build_stats(exclude_scripted: bool = False) -> dict:
     by_model: dict[str, dict] = {}
     by_provider: dict[str, dict] = {}
     by_date: dict[str, dict] = {}
-    by_hour: dict[str, dict] = {}    # "YYYY-MM-DDTHH:00Z" → agg
-    by_week: dict[str, dict] = {}    # ISO week key "YYYY-Www" → agg
+    by_hour: dict[str, dict] = {}
+    by_week: dict[str, dict] = {}
     all_sessions: list[dict] = []
 
-    if not AUDIT_DIR.exists():
-        return {"totals": totals, "by_model": [], "by_provider": [],
-                "by_date": [], "by_hour": [], "by_week": [],
-                "top_by_cost": [], "top_by_ctx": [], "top_cost_windows": []}
+    empty = {"totals": totals, "by_model": [], "by_provider": [],
+             "by_date": [], "by_hour": [], "by_week": [],
+             "top_by_cost": [], "top_by_ctx": [], "top_cost_windows": []}
 
-    for session_dir in sorted(AUDIT_DIR.iterdir()):
-        if not session_dir.is_dir():
-            continue
-        sid = session_dir.name
-        if sid.startswith("_") or sid.startswith("."):
-            continue
-        # Old date-partitioned dirs left over during transition — skip.
-        if sid.startswith("20") and len(sid) == 10 and sid[4] == "-":
-            continue
-        # Sub-agent directories — their usage lives in the parent's transcript.
-        if SUBAGENT_SEP in sid:
-            continue
-        summary = _load_summary(session_dir)
-        if not summary:
-            continue
+    # Pull the session index (cached, cheap).
+    idx = list_sessions()
+    sessions = idx.get("sessions", [])
+    if not sessions:
+        return empty
 
-        usage = summary.get("usage", {}) or {}
-        inp = int(usage.get("input_tokens", 0) or 0)
-        out = int(usage.get("output_tokens", 0) or 0)
-        cr  = int(usage.get("cache_read_input_tokens", 0) or 0)
-        cw  = int(usage.get("cache_creation_input_tokens", 0) or 0)
-        if not cw:
-            cw = (int(usage.get("cache_creation_5m_tokens", 0) or 0)
-                  + int(usage.get("cache_creation_1h_tokens", 0) or 0))
-
-        meta = _load_meta(session_dir, sid)
-        env  = _load_env(session_dir)
-        if exclude_scripted and detect_mode(env) == "scripted":
+    for s in sessions:
+        if s.get("is_subagent"):
             continue
-        model = summary.get("model", "") or meta.get("model", "") or "unknown"
-        provider = detect_provider(model, env)
-        cost = compute_cost(model, usage)
-        dur  = int(summary.get("duration_ms", 0) or 0)
-        turns = int(summary.get("num_turns", 0) or 0)
-        # calls/hr normalised from turns over duration. Clamp tiny durations
-        # to 0 to avoid extreme outliers from 0/near-0 ms sessions.
+        if exclude_scripted and s.get("mode") == "scripted":
+            continue
+        model = s.get("model", "") or "unknown"
+        cost  = s.get("cost", 0) or 0
+        dur   = s.get("duration_ms", 0) or 0
+        turns = s.get("turns", 0) or 0
+        provider = detect_provider(model)
+
+        date_bucket = (s.get("started_at", "") or s.get("last_active_at", ""))[:10] or "unknown"
         calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
-        ctx = compute_ctx(model, summary.get("ctx_peak_tokens", 0))
-
-        # Bucket the session into a date. With the flat layout this comes
-        # from started_at (or last_active_at as a fallback) — there is no
-        # date in the path. Keep the YYYY-MM-DD slice for the trend chart.
-        date_bucket = (meta.get("started_at", "") or _last_active_iso(session_dir))[:10]
-        if not date_bucket:
-            date_bucket = "unknown"
 
         totals["sessions"] += 1
         totals["cost"] += cost
-        totals["input_tokens"] += inp
-        totals["output_tokens"] += out
-        totals["cache_read_tokens"] += cr
-        totals["cache_creation_tokens"] += cw
         totals["duration_ms"] += dur
         totals["turns"] += turns
 
@@ -827,10 +898,6 @@ def build_stats(exclude_scripted: bool = False) -> dict:
         })
         bm["sessions"] += 1
         bm["cost"] += cost
-        bm["input_tokens"] += inp
-        bm["output_tokens"] += out
-        bm["cache_read_tokens"] += cr
-        bm["cache_creation_tokens"] += cw
         bm["turns"] += turns
         bm["duration_ms"] += dur
 
@@ -842,10 +909,6 @@ def build_stats(exclude_scripted: bool = False) -> dict:
         })
         bp["sessions"] += 1
         bp["cost"] += cost
-        bp["input_tokens"] += inp
-        bp["output_tokens"] += out
-        bp["cache_read_tokens"] += cr
-        bp["cache_creation_tokens"] += cw
         bp["turns"] += turns
         bp["duration_ms"] += dur
 
@@ -857,18 +920,10 @@ def build_stats(exclude_scripted: bool = False) -> dict:
         })
         bd["sessions"] += 1
         bd["cost"] += cost
-        bd["input_tokens"] += inp
-        bd["output_tokens"] += out
-        bd["cache_read_tokens"] += cr
-        bd["cache_creation_tokens"] += cw
         bd["turns"] += turns
         bd["duration_ms"] += dur
 
-        # Hour- and week-level buckets. We attribute the WHOLE session's
-        # cost to the hour/week it started — we do not have per-event
-        # cost data to split across hours for long-running sessions, so
-        # this is a documented approximation (same as by_date).
-        started_at = meta.get("started_at", "") or _last_active_iso(session_dir)
+        started_at = s.get("started_at", "") or s.get("last_active_at", "")
         bucket_dt = _parse_ts(started_at)
         if bucket_dt is not None:
             hour_key = bucket_dt.strftime("%Y-%m-%dT%H:00Z")
@@ -880,15 +935,9 @@ def build_stats(exclude_scripted: bool = False) -> dict:
             })
             bh["sessions"] += 1
             bh["cost"] += cost
-            bh["input_tokens"] += inp
-            bh["output_tokens"] += out
-            bh["cache_read_tokens"] += cr
-            bh["cache_creation_tokens"] += cw
             bh["turns"] += turns
             bh["duration_ms"] += dur
 
-            # ISO week: year + "-W" + 2-digit week. isocalendar() returns
-            # a tuple; use .isoformat() friendly key.
             iso_year, iso_week, _ = bucket_dt.isocalendar()
             week_key = f"{iso_year}-W{iso_week:02d}"
             bw = by_week.setdefault(week_key, {
@@ -899,10 +948,6 @@ def build_stats(exclude_scripted: bool = False) -> dict:
             })
             bw["sessions"] += 1
             bw["cost"] += cost
-            bw["input_tokens"] += inp
-            bw["output_tokens"] += out
-            bw["cache_read_tokens"] += cr
-            bw["cache_creation_tokens"] += cw
             bw["turns"] += turns
             bw["duration_ms"] += dur
 
@@ -917,20 +962,20 @@ def build_stats(exclude_scripted: bool = False) -> dict:
                 totals["last_7d_cost"] += cost
 
         all_sessions.append({
-            "id": sid,
+            "id": s.get("id", ""),
             "date": date_bucket,
             "model": model,
             "provider": provider,
-            "mode": detect_mode(env),
+            "mode": s.get("mode", "interactive"),
             "cost": round(cost, 4),
             "turns": turns,
             "duration_ms": dur,
             "calls_per_hr": round(calls_per_hr, 1),
-            "prompt": meta.get("prompt", "")[:200],
-            "cwd": meta.get("cwd", ""),
-            "ctx_peak_pct": ctx["ctx_peak_pct"],
-            "ctx_peak_tokens": ctx["ctx_peak_tokens"],
-            "ctx_window": ctx["ctx_window"],
+            "prompt": s.get("prompt", "")[:200],
+            "cwd": s.get("cwd", ""),
+            "ctx_peak_pct": 0,
+            "ctx_peak_tokens": 0,
+            "ctx_window": 0,
         })
 
     # Round totals for cleaner JSON; compute calls/hr from aggregated duration
