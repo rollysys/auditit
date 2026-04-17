@@ -535,17 +535,23 @@ def _scan_transcript_header(path: Path, sid: str = "") -> dict:
                     if not first_prompt and content:
                         first_prompt = content[:200]
                 elif t == "user":
+                    if obj.get("isMeta"):
+                        continue
                     num_user_turns += 1
                     msg = obj.get("message", {})
                     content = msg.get("content", "") if isinstance(msg, dict) else ""
                     if isinstance(content, str) and not first_prompt:
-                        if content and not content.startswith("<local-command"):
+                        if (content
+                            and not content.startswith("<local-command")
+                            and not content.startswith("<command-name>")):
                             first_prompt = content[:200]
                     elif isinstance(content, list):
                         for item in content:
                             if isinstance(item, dict) and item.get("type") == "text":
                                 text = item.get("text", "")
-                                if not first_prompt and text and not text.startswith("<local-command"):
+                                if (not first_prompt and text
+                                    and not text.startswith("<local-command")
+                                    and not text.startswith("<command-name>")):
                                     first_prompt = text[:200]
                                     break
                 elif t == "assistant":
@@ -1498,7 +1504,9 @@ def read_transcript(session_id: str) -> dict:
                         tool_use_result = {}
 
                     if isinstance(content, str) and content:
-                        if not first_prompt and not content.startswith("<local-command"):
+                        if (not first_prompt
+                            and not content.startswith("<local-command")
+                            and not content.startswith("<command-name>")):
                             first_prompt = content[:200]
                         events.append({"type": "user_text", "text": content,
                                        "timestamp": ts})
