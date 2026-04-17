@@ -1421,12 +1421,11 @@ def read_transcript(session_id: str) -> dict:
                         seen_msg_ids.add(mid)
                     if m and not is_synthetic:
                         model = m
-                    # Only accumulate usage from real (non-synthetic) messages.
+                    # Accumulate usage from real (non-synthetic) messages only.
                     # Synthetic messages are Claude Code's client-side error
                     # responses (e.g. "Not logged in") — they carry no API usage.
-                    if not is_synthetic:
-                        usage = msg.get("usage", {})
-                        if isinstance(usage, dict):
+                    usage = msg.get("usage", {}) if not is_synthetic else {}
+                    if not is_synthetic and isinstance(usage, dict):
                             cum_usage["input_tokens"] += (usage.get("input_tokens", 0) or 0)
                             cum_usage["output_tokens"] += (usage.get("output_tokens", 0) or 0)
                             cum_usage["cache_read_input_tokens"] += (usage.get("cache_read_input_tokens", 0) or 0)
