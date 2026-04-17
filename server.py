@@ -500,7 +500,7 @@ def _scan_transcript_header(path: Path, sid: str = "") -> dict:
     Metadata (cwd, entrypoint, prompt, timestamps): from header lines only.
     Usage and cost: from _compute_session_usage (full parse, disk-cached).
     """
-    cwd = entrypoint = first_prompt = model = ""
+    cwd = entrypoint = first_prompt = model = permission_mode = ""
     started_at = last_ts = ""
     usage: dict = {}
     num_user_turns = 0
@@ -527,6 +527,8 @@ def _scan_transcript_header(path: Path, sid: str = "") -> dict:
                     cwd = obj.get("cwd", "") or ""
                 if not entrypoint:
                     entrypoint = obj.get("entrypoint", "") or ""
+                if not permission_mode:
+                    permission_mode = obj.get("permissionMode", "") or ""
                 t = obj.get("type", "")
                 if t == "queue-operation" and obj.get("operation") == "enqueue":
                     content = obj.get("content", "")
@@ -595,7 +597,8 @@ def _scan_transcript_header(path: Path, sid: str = "") -> dict:
         "usage": full,
         "num_turns": full.get("num_turns", 0),
         "ctx_peak_tokens": full.get("ctx_peak_tokens", 0),
-        "is_headless": entrypoint == "sdk-cli",
+        "is_headless": permission_mode == "bypassPermissions" or entrypoint == "sdk-cli",
+        "permission_mode": permission_mode,
     }
 
 
