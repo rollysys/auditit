@@ -770,6 +770,22 @@ function _fmtCtx(s) {
 
 async function loadMeta(sessionId) {
   const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/meta`);
+  if (!res.ok) {
+    // No meta available — show minimal info from session list
+    const infoBar = document.getElementById('infoBar');
+    let s = null;
+    for (const ss of Object.values(allSessions)) {
+      s = ss.find(x => x.id === sessionId);
+      if (s) break;
+    }
+    infoBar.innerHTML = `
+      <div class="info-item"><label>ID: </label><span class="session-id">${esc(sessionId)}</span><button class="copy-id-btn" onclick="copySessionId(this, '${esc(sessionId)}')">复制</button></div>
+      <div class="info-item"><label>Model: </label><span>${esc(s?.model || '—')}</span></div>
+      <div class="info-item"><label>Cost: </label><span>${s?.cost ? '$' + s.cost.toFixed(4) : '—'}</span></div>
+      <div class="prompt-bar" title="${escAttr(s?.prompt || '')}">${esc(s?.prompt?.substring(0, 200) || '—')}</div>
+    `;
+    return;
+  }
   const data = await res.json();
   const infoBar = document.getElementById('infoBar');
 

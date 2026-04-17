@@ -2146,13 +2146,35 @@ class AuditHandler(SimpleHTTPRequestHandler):
         self._json(list(seen.values()))
 
     def _serve_meta(self, session_id: str):
-        session_dir = resolve_session(unquote(session_id))
-        if not session_dir:
-            self.send_response(404)
-            self.end_headers()
-            return
-        meta = _load_meta(session_dir, session_id)
-        summary = _load_summary(session_dir)
+        session_id = unquote(session_id)
+        session_dir = resolve_session(session_id)
+        if session_dir:
+            meta = _load_meta(session_dir, session_id)
+            summary = _load_summary(session_dir)
+        else:
+            # No audit dir — build meta from transcript (pure viewer mode)
+            header = None
+            tp = _find_transcript(session_id)
+            if tp:
+                header = _scan_transcript_header(tp, session_id)
+            if not header:
+                self.send_response(404)
+                self.end_headers()
+                return
+            meta = {
+                "prompt": header.get("first_prompt", ""),
+                "model":  header.get("model", ""),
+                "cwd":    header.get("cwd", ""),
+                "started_at": header.get("started_at", ""),
+            }
+            usage = header.get("usage", {})
+            summary = {
+                "model": header.get("model", ""),
+                "num_turns": header.get("num_turns", 0),
+                "duration_ms": 0,
+                "usage": usage,
+                "ctx_peak_tokens": header.get("ctx_peak_tokens", 0),
+            }
 
         # Fix buggy old summary.json usage: the old _parse_transcript only
         # stored the LAST assistant message's usage (not accumulated).
