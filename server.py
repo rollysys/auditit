@@ -348,13 +348,12 @@ _SESSION_INDEX_TTL = 30.0  # seconds
 COST_CACHE_DIR = AUDIT_DIR / "_cost_cache"
 
 
-def _compute_window_cost(path: Path, model: str, cutoff_iso: str) -> float:
-    """Compute cost for turns whose timestamp >= cutoff_iso.
+def _compute_window_usage(path: Path, model: str, cutoff_iso: str) -> dict:
+    """Compute usage + cost for turns whose timestamp >= cutoff_iso.
 
     Walks the transcript, applies streaming merge (last usage per message.id),
-    and sums only turns within the time window. Returns USD cost float.
-    No caching — this is called per-session per-dashboard-load when a
-    time range is active.
+    and sums only turns within the time window. Returns dict with cost float
+    and token breakdown.
     """
     from datetime import datetime as _dt
     try:
@@ -434,9 +433,18 @@ def _compute_window_cost(path: Path, model: str, cutoff_iso: str) -> float:
         if pending_mid:
             _flush()
     except OSError:
-        return 0.0
+        return {"cost": 0.0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_creation_tokens": 0}
 
-    return compute_cost(model, cum)
+    return {
+        "cost": compute_cost(model, cum),
+        "input_tokens": cum["input_tokens"],
+        "output_tokens": cum["output_tokens"],
+        "cache_read_tokens": cum["cache_read_input_tokens"],
+        "cache_creation_tokens": cum["cache_creation_input_tokens"]
+                                 + cum["cache_creation_5m_tokens"]
+                                 + cum["cache_creation_1h_tokens"],
+    }
 
 
 def _compute_session_usage(path: Path, sid: str) -> dict:
@@ -1135,26 +1143,34 @@ def build_stats(exclude_scripted: bool = False,
         turns = s.get("turns", 0) or 0
         provider = detect_provider(model)
 
-        # Window cost: for time-ranged views, compute cost only for turns
-        # within the window. For "all", window_cost == total_cost.
+        # Window usage: for time-ranged views, compute cost + tokens only for
+        # turns within the window. For "all", window == total.
         if cutoff_dt and total_cost > 0:
             sid = s.get("id", "")
             tp = _find_transcript(sid) if sid else None
             if tp:
                 cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                window_cost = _compute_window_cost(tp, model, cutoff_iso)
+                wu = _compute_window_usage(tp, model, cutoff_iso)
+                window_cost = wu.get("cost", 0.0)
+                inp = wu.get("input_tokens", 0)
+                out = wu.get("output_tokens", 0)
+                cr  = wu.get("cache_read_tokens", 0)
+                cw  = wu.get("cache_creation_tokens", 0)
             else:
                 window_cost = total_cost
+                inp = s.get("input_tokens", 0) or 0
+                out = s.get("output_tokens", 0) or 0
+                cr  = s.get("cache_read_tokens", 0) or 0
+                cw  = s.get("cache_creation_tokens", 0) or 0
         else:
             window_cost = total_cost
+            inp = s.get("input_tokens", 0) or 0
+            out = s.get("output_tokens", 0) or 0
+            cr  = s.get("cache_read_tokens", 0) or 0
+            cw  = s.get("cache_creation_tokens", 0) or 0
 
         started_at = s.get("started_at", "") or s.get("last_active_at", "")
         date_bucket = started_at[:10] or "unknown"
-
-        inp = s.get("input_tokens", 0) or 0
-        out = s.get("output_tokens", 0) or 0
-        cr  = s.get("cache_read_tokens", 0) or 0
-        cw  = s.get("cache_creation_tokens", 0) or 0
 
         totals["sessions"] += 1
         totals["cost"] += window_cost
