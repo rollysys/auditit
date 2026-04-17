@@ -958,18 +958,21 @@ def detect_provider(model: str, env: dict | None = None) -> str:
     return "other"
 
 
-def build_stats(exclude_scripted: bool = False) -> dict:
-    """Aggregate across all sessions for the Dashboard view.
+_RANGE_DAYS = {"1d": 1, "7d": 7, "30d": 30, "all": None}
 
-    Reuses list_sessions()'s cached transcript index — no separate scan.
-    Sub-agents are excluded (list_sessions already filters them).
 
-    Cost comes from the transcript header's tail-read usage + model →
-    compute_cost(). This is the same data source as the Sessions list,
-    so totals are consistent.
+def build_stats(exclude_scripted: bool = False,
+                time_range: str = "all") -> dict:
+    """Aggregate across sessions for the Dashboard view.
+
+    time_range: "1d" / "7d" / "30d" / "all". Filters sessions by
+    started_at so ALL aggregates (totals, by_model, by_provider,
+    top tables) are scoped to the same window.
     """
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     now_utc = _dt.now(_tz.utc)
+    range_days = _RANGE_DAYS.get(time_range)
+    cutoff_dt = (now_utc - _td(days=range_days)) if range_days else None
 
     def _parse_ts(s):
         if not isinstance(s, str):
@@ -1010,13 +1013,21 @@ def build_stats(exclude_scripted: bool = False) -> dict:
             continue
         if exclude_scripted and s.get("mode") == "scripted":
             continue
+
+        # Time range filter — applies to ALL aggregates uniformly
+        started_at = s.get("started_at", "") or s.get("last_active_at", "")
+        if cutoff_dt and started_at:
+            s_dt = _parse_ts(started_at)
+            if s_dt and s_dt < cutoff_dt:
+                continue
+
         model = s.get("model", "") or "unknown"
         cost  = s.get("cost", 0) or 0
         dur   = s.get("duration_ms", 0) or 0
         turns = s.get("turns", 0) or 0
         provider = detect_provider(model)
 
-        date_bucket = (s.get("started_at", "") or s.get("last_active_at", ""))[:10] or "unknown"
+        date_bucket = started_at[:10] or "unknown"
         calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
 
         totals["sessions"] += 1
@@ -1931,7 +1942,11 @@ class AuditHandler(SimpleHTTPRequestHandler):
             from urllib.parse import parse_qs
             qs = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             exclude = (qs.get("exclude_scripted") or ["0"])[0] in ("1", "true", "yes")
-            self._json(build_stats(exclude_scripted=exclude))
+            time_range = (qs.get("range") or ["all"])[0]
+            if time_range not in _RANGE_DAYS:
+                time_range = "all"
+            self._json(build_stats(exclude_scripted=exclude,
+                                   time_range=time_range))
         elif path == "/api/skills":
             self._json(list_skills())
         elif path == "/api/skills/file":

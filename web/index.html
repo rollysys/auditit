@@ -404,6 +404,12 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
     </div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
+    <select id="dashRangeSelect" style="font-size:11px;background:var(--bg2);color:var(--fg);border:1px solid var(--border);border-radius:3px;padding:2px 6px;cursor:pointer">
+      <option value="1d">Last 24h</option>
+      <option value="7d" selected>Last 7 days</option>
+      <option value="30d">Last 30 days</option>
+      <option value="all">All time</option>
+    </select>
     <label id="scriptedToggle" style="font-size:11px;color:var(--gray);user-select:none;cursor:pointer">
       <input type="checkbox" id="showScriptedChk" style="vertical-align:middle;margin-right:4px">
       show scripted
@@ -1769,7 +1775,12 @@ async function loadDashboard() {
   dashboardChartsInstances.forEach(c => { try { c.destroy(); } catch (e) {} });
   dashboardChartsInstances = [];
   try {
-    const url = showScripted ? '/api/stats' : '/api/stats?exclude_scripted=1';
+    const range = document.getElementById('dashRangeSelect')?.value || 'all';
+    const params = new URLSearchParams();
+    if (!showScripted) params.set('exclude_scripted', '1');
+    if (range !== 'all') params.set('range', range);
+    const qs = params.toString();
+    const url = '/api/stats' + (qs ? '?' + qs : '');
     const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const s = await res.json();
@@ -1796,7 +1807,8 @@ function renderDashboard(s) {
   html += '</div>';
 
   // Top cards
-  html += '<div class="dash-section-title">Overview · all sessions</div>';
+  const rangeLabel = {'1d':'last 24h','7d':'last 7 days','30d':'last 30 days','all':'all time'}[document.getElementById('dashRangeSelect')?.value || 'all'] || 'all time';
+  html += `<div class="dash-section-title">Overview · ${rangeLabel}</div>`;
   html += '<div class="dash-cards">';
   html += `<div class="dash-card primary"><div class="label">Sessions</div><div class="value">${t.sessions}</div><div class="sub">${_fmtDur(t.duration_ms)} total</div></div>`;
   html += `<div class="dash-card cost"><div class="label">Cost</div><div class="value">${_fmtCost(t.cost)}</div><div class="sub">avg ${_fmtCost(avgCost)}/session</div></div>`;
@@ -2424,6 +2436,21 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ========== Init ==========
+// Dashboard range selector — reload dashboard when range changes
+document.getElementById('dashRangeSelect')?.addEventListener('change', () => {
+  if (currentView === 'dashboard') loadDashboard();
+});
+// Persist range selection in localStorage
+try {
+  const saved = localStorage.getItem('auditit.dashRange');
+  if (saved && document.getElementById('dashRangeSelect')) {
+    document.getElementById('dashRangeSelect').value = saved;
+  }
+} catch (e) {}
+document.getElementById('dashRangeSelect')?.addEventListener('change', (ev) => {
+  try { localStorage.setItem('auditit.dashRange', ev.target.value); } catch (e) {}
+});
+
 loadSessions();
 loadVersionBadge();
 </script>
