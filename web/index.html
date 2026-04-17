@@ -1942,13 +1942,18 @@ function _renderCostPage(page) {
   const start = (page - 1) * _PAGE_SIZE;
   const slice = data.slice(start, start + _PAGE_SIZE);
 
-  let html = '<table class="dash-table"><thead><tr><th>Date</th><th>Provider</th><th>Model</th><th class="num">Cost</th><th class="num">Turns</th><th>Prompt</th></tr></thead><tbody>';
+  const rangeVal = document.getElementById('dashRangeSelect')?.value || 'all';
+  const hasWindow = rangeVal !== 'all';
+  let html = '<table class="dash-table"><thead><tr><th>CWD</th><th>Model</th>';
+  if (hasWindow) html += '<th class="num">Window $</th>';
+  html += '<th class="num">Total $</th><th class="num">Turns</th><th>Prompt</th></tr></thead><tbody>';
   for (const r of slice) {
+    const cwdBase = (r.cwd || '').split('/').pop() || '~';
     html += `<tr data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
-    html += `<td>${esc(r.date)}</td>`;
-    html += `<td><span class="dash-provider-chip ${esc(r.provider || 'unknown')}">${esc(r.provider || 'unknown')}</span></td>`;
+    html += `<td title="${escAttr(r.cwd || '')}">${esc(cwdBase)}</td>`;
     html += `<td><span class="dash-model-chip">${esc(r.model)}</span></td>`;
-    html += `<td class="num">${_fmtCost(r.cost)}</td>`;
+    if (hasWindow) html += `<td class="num" style="font-weight:600">${_fmtCost(r.window_cost)}</td>`;
+    html += `<td class="num" style="color:var(--gray)">${_fmtCost(r.total_cost)}</td>`;
     html += `<td class="num">${r.turns || 0}</td>`;
     html += `<td class="dash-cell-prompt" title="${escAttr(r.prompt)}">${esc(r.prompt)}</td>`;
     html += '</tr>';

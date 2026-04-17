@@ -348,6 +348,97 @@ _SESSION_INDEX_TTL = 30.0  # seconds
 COST_CACHE_DIR = AUDIT_DIR / "_cost_cache"
 
 
+def _compute_window_cost(path: Path, model: str, cutoff_iso: str) -> float:
+    """Compute cost for turns whose timestamp >= cutoff_iso.
+
+    Walks the transcript, applies streaming merge (last usage per message.id),
+    and sums only turns within the time window. Returns USD cost float.
+    No caching — this is called per-session per-dashboard-load when a
+    time range is active.
+    """
+    from datetime import datetime as _dt
+    try:
+        cutoff_dt = _dt.fromisoformat(cutoff_iso.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return 0.0
+
+    cum = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_1h_tokens": 0,
+    }
+    pending_mid = ""
+    pending_usage: dict = {}
+    pending_ts = ""
+
+    def _flush():
+        if not pending_usage:
+            return
+        # Only count if the turn is within the window
+        try:
+            ts_dt = _dt.fromisoformat(pending_ts.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return
+        if ts_dt < cutoff_dt:
+            return
+        cum["input_tokens"] += (pending_usage.get("input_tokens", 0) or 0)
+        cum["output_tokens"] += (pending_usage.get("output_tokens", 0) or 0)
+        cum["cache_read_input_tokens"] += (pending_usage.get("cache_read_input_tokens", 0) or 0)
+        cum["cache_creation_input_tokens"] += (pending_usage.get("cache_creation_input_tokens", 0) or 0)
+        cc = pending_usage.get("cache_creation") or {}
+        if isinstance(cc, dict):
+            cum["cache_creation_5m_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+            cum["cache_creation_1h_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+
+    opener = gzip.open if path.name.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if obj.get("isMeta"):
+                    continue
+                t = obj.get("type", "")
+                if t == "assistant":
+                    msg = obj.get("message") or {}
+                    if not isinstance(msg, dict):
+                        continue
+                    m = msg.get("model", "") or ""
+                    if m == "<synthetic>":
+                        continue
+                    mid = msg.get("id", "") or ""
+                    u = msg.get("usage") or {}
+                    ts = obj.get("timestamp", "") or ""
+                    if mid and mid == pending_mid:
+                        if isinstance(u, dict) and u.get("output_tokens"):
+                            pending_usage = u
+                            pending_ts = ts
+                    else:
+                        if pending_mid:
+                            _flush()
+                        pending_mid = mid or f"_anon"
+                        pending_usage = u if isinstance(u, dict) else {}
+                        pending_ts = ts
+                elif t != "assistant" and pending_mid:
+                    _flush()
+                    pending_mid = ""
+                    pending_usage = {}
+                    pending_ts = ""
+        if pending_mid:
+            _flush()
+    except OSError:
+        return 0.0
+
+    return compute_cost(model, cum)
+
+
 def _compute_session_usage(path: Path, sid: str) -> dict:
     """Full-parse a transcript to sum ALL assistant usage blocks.
 
@@ -1030,17 +1121,29 @@ def build_stats(exclude_scripted: bool = False,
                 continue
 
         model = s.get("model", "") or "unknown"
-        cost  = s.get("cost", 0) or 0
+        total_cost = s.get("cost", 0) or 0
         dur   = s.get("duration_ms", 0) or 0
         turns = s.get("turns", 0) or 0
         provider = detect_provider(model)
 
+        # Window cost: for time-ranged views, compute cost only for turns
+        # within the window. For "all", window_cost == total_cost.
+        if cutoff_dt and total_cost > 0:
+            sid = s.get("id", "")
+            tp = _find_transcript(sid) if sid else None
+            if tp:
+                cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                window_cost = _compute_window_cost(tp, model, cutoff_iso)
+            else:
+                window_cost = total_cost
+        else:
+            window_cost = total_cost
+
         started_at = s.get("started_at", "") or s.get("last_active_at", "")
         date_bucket = started_at[:10] or "unknown"
-        calls_per_hr = (turns * 3_600_000.0 / dur) if dur >= 1000 else 0.0
 
         totals["sessions"] += 1
-        totals["cost"] += cost
+        totals["cost"] += window_cost
         totals["duration_ms"] += dur
         totals["turns"] += turns
 
@@ -1051,7 +1154,7 @@ def build_stats(exclude_scripted: bool = False,
             "turns": 0, "duration_ms": 0,
         })
         bm["sessions"] += 1
-        bm["cost"] += cost
+        bm["cost"] += window_cost
         bm["turns"] += turns
         bm["duration_ms"] += dur
 
@@ -1062,7 +1165,7 @@ def build_stats(exclude_scripted: bool = False,
             "turns": 0, "duration_ms": 0,
         })
         bp["sessions"] += 1
-        bp["cost"] += cost
+        bp["cost"] += window_cost
         bp["turns"] += turns
         bp["duration_ms"] += dur
 
@@ -1073,7 +1176,7 @@ def build_stats(exclude_scripted: bool = False,
             "turns": 0, "duration_ms": 0,
         })
         bd["sessions"] += 1
-        bd["cost"] += cost
+        bd["cost"] += window_cost
         bd["turns"] += turns
         bd["duration_ms"] += dur
 
@@ -1088,7 +1191,7 @@ def build_stats(exclude_scripted: bool = False,
                 "turns": 0, "duration_ms": 0,
             })
             bh["sessions"] += 1
-            bh["cost"] += cost
+            bh["cost"] += window_cost
             bh["turns"] += turns
             bh["duration_ms"] += dur
 
@@ -1101,7 +1204,7 @@ def build_stats(exclude_scripted: bool = False,
                 "turns": 0, "duration_ms": 0,
             })
             bw["sessions"] += 1
-            bw["cost"] += cost
+            bw["cost"] += window_cost
             bw["turns"] += turns
             bw["duration_ms"] += dur
 
@@ -1109,11 +1212,11 @@ def build_stats(exclude_scripted: bool = False,
             # started within that window. Same coarse-attribution caveat.
             age = now_utc - bucket_dt
             if age <= _td(hours=1):
-                totals["last_1h_cost"] += cost
+                totals["last_1h_cost"] += window_cost
             if age <= _td(hours=24):
-                totals["last_24h_cost"] += cost
+                totals["last_24h_cost"] += window_cost
             if age <= _td(days=7):
-                totals["last_7d_cost"] += cost
+                totals["last_7d_cost"] += window_cost
 
         all_sessions.append({
             "id": s.get("id", ""),
@@ -1121,10 +1224,10 @@ def build_stats(exclude_scripted: bool = False,
             "model": model,
             "provider": provider,
             "mode": s.get("mode", "interactive"),
-            "cost": round(cost, 4),
+            "total_cost": round(total_cost, 4),
+            "window_cost": round(window_cost, 4),
             "turns": turns,
             "duration_ms": dur,
-            "calls_per_hr": round(calls_per_hr, 1),
             "prompt": s.get("prompt", "")[:200],
             "cwd": s.get("cwd", ""),
             "ctx_peak_pct": 0,
@@ -1174,7 +1277,7 @@ def build_stats(exclude_scripted: bool = False,
     by_model_list    = sorted(by_model.values(),    key=lambda x: -x["cost"])
     by_provider_list = sorted(by_provider.values(), key=lambda x: -x["cost"])
 
-    top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])
+    top_by_cost = sorted(all_sessions, key=lambda x: -x["window_cost"])
     top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])
 
     # Most expensive hours: catches "many cheap sessions add up" which
