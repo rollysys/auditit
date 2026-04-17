@@ -384,8 +384,38 @@ def _compute_session_usage(path: Path, sid: str) -> dict:
     }
     model = ""
     num_turns = 0
-    seen_msg_ids: set[str] = set()
     ctx_peak = 0
+
+    # Streaming dedup for usage: same message.id appears multiple times
+    # (one per content block). The LAST line for each id carries the
+    # cumulative usage. We buffer the last-seen usage per id and flush
+    # when a new id appears or at EOF.
+    pending_mid: str = ""
+    pending_usage: dict = {}
+    pending_model: str = ""
+
+    def _flush_usage():
+        nonlocal model, ctx_peak
+        u = pending_usage
+        if not u:
+            return
+        if pending_model and pending_model != "<synthetic>":
+            model = pending_model
+        cum["input_tokens"] += (u.get("input_tokens", 0) or 0)
+        cum["output_tokens"] += (u.get("output_tokens", 0) or 0)
+        cum["cache_read_input_tokens"] += (u.get("cache_read_input_tokens", 0) or 0)
+        cum["cache_creation_input_tokens"] += (u.get("cache_creation_input_tokens", 0) or 0)
+        cc = u.get("cache_creation") or {}
+        if isinstance(cc, dict):
+            cum["cache_creation_5m_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+            cum["cache_creation_1h_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+        ctx_now = (
+            (u.get("input_tokens", 0) or 0)
+            + (u.get("cache_read_input_tokens", 0) or 0)
+            + (u.get("cache_creation_input_tokens", 0) or 0)
+        )
+        if ctx_now > ctx_peak:
+            ctx_peak = ctx_now
 
     opener = gzip.open if path.name.endswith(".gz") else open
     try:
@@ -398,40 +428,51 @@ def _compute_session_usage(path: Path, sid: str) -> dict:
                     obj = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                if obj.get("type") == "user":
-                    msg = obj.get("message", {})
+                if obj.get("isMeta"):
+                    continue
+                t = obj.get("type", "")
+                if t == "user":
+                    msg = obj.get("message") or {}
                     if isinstance(msg, dict) and msg.get("role") == "user":
                         num_turns += 1
-                elif obj.get("type") == "assistant":
-                    msg = obj.get("message", {})
+                    # Flush pending assistant
+                    if pending_mid:
+                        _flush_usage()
+                        pending_mid = ""
+                        pending_usage = {}
+                        pending_model = ""
+                elif t == "assistant":
+                    msg = obj.get("message") or {}
                     if not isinstance(msg, dict):
                         continue
-                    m = msg.get("model", "")
-                    if m and m != "<synthetic>":
-                        model = m
-                    mid = msg.get("id", "")
-                    if mid and mid in seen_msg_ids:
-                        continue
-                    if mid:
-                        seen_msg_ids.add(mid)
-                    u = msg.get("usage")
-                    if not isinstance(u, dict):
-                        continue
-                    cum["input_tokens"] += (u.get("input_tokens", 0) or 0)
-                    cum["output_tokens"] += (u.get("output_tokens", 0) or 0)
-                    cum["cache_read_input_tokens"] += (u.get("cache_read_input_tokens", 0) or 0)
-                    cum["cache_creation_input_tokens"] += (u.get("cache_creation_input_tokens", 0) or 0)
-                    cc = u.get("cache_creation") or {}
-                    if isinstance(cc, dict):
-                        cum["cache_creation_5m_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
-                        cum["cache_creation_1h_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
-                    ctx_now = (
-                        (u.get("input_tokens", 0) or 0)
-                        + (u.get("cache_read_input_tokens", 0) or 0)
-                        + (u.get("cache_creation_input_tokens", 0) or 0)
-                    )
-                    if ctx_now > ctx_peak:
-                        ctx_peak = ctx_now
+                    m = msg.get("model", "") or ""
+                    mid = msg.get("id", "") or ""
+                    u = msg.get("usage") or {}
+                    if mid and mid == pending_mid:
+                        # Same streaming message — take LAST usage (cumulative)
+                        if isinstance(u, dict) and u.get("output_tokens"):
+                            pending_usage = u
+                        if m and m != "<synthetic>":
+                            pending_model = m
+                    else:
+                        # New message — flush previous
+                        if pending_mid:
+                            _flush_usage()
+                        pending_mid = mid or f"_anon_{num_turns}"
+                        pending_usage = u if isinstance(u, dict) else {}
+                        pending_model = m
+                else:
+                    # Non user/assistant line — flush pending
+                    if pending_mid:
+                        _flush_usage()
+                        pending_mid = ""
+                        pending_usage = {}
+                        pending_model = ""
+
+        # Flush final pending at EOF
+        if pending_mid:
+            _flush_usage()
+
     except OSError:
         return {}
 
@@ -1322,35 +1363,74 @@ def read_transcript(session_id: str) -> dict:
     Returns: {"events": [...], "entrypoint": str, "is_headless": bool,
               "cwd": str, "first_prompt": str, "model": str, "usage": dict}
 
-    The transcript contains raw Claude API-level messages. We normalize
-    them into a flat event list with types the frontend understands:
-      - {type: "user_text", text, timestamp}
-      - {type: "tool_result", tool_use_id, content, is_error, timestamp}
-      - {type: "assistant_text", text, model, usage, timestamp}
-      - {type: "assistant_thinking", text, model, usage, timestamp}
-      - {type: "assistant_tool_use", name, id, input, model, usage, timestamp}
+    Streaming dedup: Claude Code writes one JSONL line per content block
+    for each assistant message, all sharing the same message.id. A message
+    with (thinking + text + tool_use) produces 3 lines. We merge them by
+    collecting all lines with the same message.id, concatenating their
+    content[] arrays, and taking the LAST line's usage (which is the
+    cumulative value; earlier lines have partial/zero usage).
+
+    Supported line types:
+      user        → user_text / tool_result events
+      assistant   → assistant_text / assistant_thinking / assistant_tool_use
+      system      → system_event (api_error, compact_boundary, etc.)
+      queue-operation → extract first prompt from enqueue
+      attachment, progress, file-history-snapshot, etc. → skipped
+
+    Lines with isMeta=true are skipped (internal/command messages).
     """
     path = _find_transcript(session_id)
     if not path:
         return {}
 
-    # Map tool_use_id → tool name, for enriching tool_result events
-    tool_name_map: dict[str, str] = {}
-
+    tool_name_map: dict[str, str] = {}  # tool_use_id → tool name
     events: list = []
     entrypoint = ""
-    is_headless = False
     cwd = ""
     first_prompt = ""
     model = ""
-    cum_usage: dict = {
-        "input_tokens": 0, "output_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "cache_creation": {"ephemeral_5m_input_tokens": 0,
-                           "ephemeral_1h_input_tokens": 0},
-    }
-    seen_msg_ids: set[str] = set()
+
+    # For streaming dedup: buffer assistant lines by message.id, flush
+    # when we see a different id or a non-assistant line.
+    pending_mid: str = ""         # message.id currently being buffered
+    pending_blocks: list = []     # content blocks accumulated
+    pending_meta: dict = {}       # model, usage, timestamp, etc. from LAST line
+
+    def _flush_assistant():
+        """Emit events from the buffered assistant message blocks."""
+        nonlocal model
+        if not pending_blocks:
+            return
+        m = pending_meta.get("model", "")
+        is_syn = (m == "<synthetic>")
+        if m and not is_syn:
+            model = m
+        usage = pending_meta.get("usage", {})
+        ts = pending_meta.get("timestamp", "")
+
+        for item in pending_blocks:
+            if not isinstance(item, dict):
+                continue
+            it = item.get("type", "")
+            if it == "text":
+                events.append({"type": "assistant_text",
+                               "text": item.get("text", ""),
+                               "model": m, "usage": usage,
+                               "timestamp": ts})
+            elif it == "thinking":
+                events.append({"type": "assistant_thinking",
+                               "text": item.get("thinking", ""),
+                               "model": m, "usage": usage,
+                               "timestamp": ts})
+            elif it == "tool_use":
+                tid = item.get("id", "")
+                name = item.get("name", "")
+                tool_name_map[tid] = name
+                events.append({"type": "assistant_tool_use",
+                               "name": name, "id": tid,
+                               "input": item.get("input", {}),
+                               "model": m, "usage": usage,
+                               "timestamp": ts})
 
     opener = gzip.open if path.name.endswith(".gz") else open
     try:
@@ -1364,26 +1444,47 @@ def read_transcript(session_id: str) -> dict:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
 
+                # Skip internal/command messages
+                if obj.get("isMeta"):
+                    continue
+
                 # Session-level metadata (from any line that has it)
                 if not entrypoint and obj.get("entrypoint"):
                     entrypoint = obj["entrypoint"]
                 if not cwd and obj.get("cwd"):
                     cwd = obj["cwd"]
 
-                # Detect headless: entrypoint=sdk-cli means claude -p
                 t = obj.get("type", "")
-                if t == "queue-operation" and obj.get("operation") == "enqueue":
-                    content = obj.get("content", "")
-                    if not first_prompt and content:
-                        first_prompt = content[:200]
-
                 ts = obj.get("timestamp", "")
-                msg = obj.get("message", {})
+                msg = obj.get("message") or {}
+                if not isinstance(msg, dict):
+                    msg = {}
 
+                # ── queue-operation: extract first prompt ──
+                if t == "queue-operation":
+                    if obj.get("operation") == "enqueue":
+                        content = obj.get("content", "")
+                        if not first_prompt and content:
+                            first_prompt = content[:200]
+                    continue
+
+                # ── user ──
                 if t == "user":
+                    # Flush any pending assistant
+                    if pending_mid:
+                        _flush_assistant()
+                        pending_mid = ""
+                        pending_blocks = []
+                        pending_meta = {}
+
                     content = msg.get("content", "")
-                    if isinstance(content, str):
-                        if not first_prompt and content and not content.startswith("<local-command"):
+                    # Also extract toolUseResult details from top-level
+                    tool_use_result = obj.get("toolUseResult") or {}
+                    if not isinstance(tool_use_result, dict):
+                        tool_use_result = {}
+
+                    if isinstance(content, str) and content:
+                        if not first_prompt and not content.startswith("<local-command"):
                             first_prompt = content[:200]
                         events.append({"type": "user_text", "text": content,
                                        "timestamp": ts})
@@ -1401,80 +1502,93 @@ def read_transcript(session_id: str) -> dict:
                                                "timestamp": ts})
                             elif it == "tool_result":
                                 tid = item.get("tool_use_id", "")
+                                # Merge top-level toolUseResult details
+                                tr_content = item.get("content", "")
+                                if tool_use_result and tid:
+                                    # toolUseResult has stdout/stderr/interrupted
+                                    stdout = tool_use_result.get("stdout", "")
+                                    stderr = tool_use_result.get("stderr", "")
+                                    if stdout and not tr_content:
+                                        tr_content = stdout
                                 events.append({
                                     "type": "tool_result",
                                     "tool_use_id": tid,
                                     "tool_name": tool_name_map.get(tid, ""),
-                                    "content": item.get("content", ""),
+                                    "content": tr_content,
                                     "is_error": bool(item.get("is_error")),
+                                    "interrupted": bool(tool_use_result.get("interrupted")),
                                     "timestamp": ts,
                                 })
+                    continue
 
-                elif t == "assistant":
-                    m = msg.get("model", "")
-                    is_synthetic = (m == "<synthetic>")
-                    # Deduplicate
-                    mid = msg.get("id", "")
-                    if mid and mid in seen_msg_ids:
-                        continue
-                    if mid:
-                        seen_msg_ids.add(mid)
-                    if m and not is_synthetic:
-                        model = m
-                    # Accumulate usage from real (non-synthetic) messages only.
-                    # Synthetic messages are Claude Code's client-side error
-                    # responses (e.g. "Not logged in") — they carry no API usage.
-                    usage = msg.get("usage", {}) if not is_synthetic else {}
-                    if not is_synthetic and isinstance(usage, dict):
-                            cum_usage["input_tokens"] += (usage.get("input_tokens", 0) or 0)
-                            cum_usage["output_tokens"] += (usage.get("output_tokens", 0) or 0)
-                            cum_usage["cache_read_input_tokens"] += (usage.get("cache_read_input_tokens", 0) or 0)
-                            cum_usage["cache_creation_input_tokens"] += (usage.get("cache_creation_input_tokens", 0) or 0)
-                            cc = usage.get("cache_creation") or {}
-                            if isinstance(cc, dict):
-                                cum_usage["cache_creation"]["ephemeral_5m_input_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
-                                cum_usage["cache_creation"]["ephemeral_1h_input_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
-
+                # ── assistant (streaming merge by message.id) ──
+                if t == "assistant":
+                    mid = msg.get("id", "") or ""
+                    m = msg.get("model", "") or ""
+                    usage = msg.get("usage", {}) or {}
                     content = msg.get("content", [])
-                    if isinstance(content, str) and content:
-                        events.append({"type": "assistant_text",
-                                       "text": content,
-                                       "model": m,
-                                       "usage": {},
-                                       "timestamp": ts})
-                        continue
-                    if not isinstance(content, list):
-                        continue
-                    for item in content:
-                        if not isinstance(item, dict):
-                            continue
-                        it = item.get("type", "")
-                        if it == "text":
-                            events.append({"type": "assistant_text",
-                                           "text": item.get("text", ""),
-                                           "model": m,
-                                           "usage": usage,
-                                           "timestamp": ts})
-                        elif it == "thinking":
-                            events.append({"type": "assistant_thinking",
-                                           "text": item.get("thinking", ""),
-                                           "model": m,
-                                           "usage": usage,
-                                           "timestamp": ts})
-                        elif it == "tool_use":
-                            tid = item.get("id", "")
-                            name = item.get("name", "")
-                            tool_name_map[tid] = name
-                            events.append({
-                                "type": "assistant_tool_use",
-                                "name": name,
-                                "id": tid,
-                                "input": item.get("input", {}),
-                                "model": m,
-                                "usage": usage,
-                                "timestamp": ts,
-                            })
-                # Skip: system, file-history-snapshot, attachment, etc.
+
+                    if mid and mid == pending_mid:
+                        # Same message — append content blocks, update meta
+                        # (last line's usage is cumulative, so always overwrite)
+                        if isinstance(content, list):
+                            pending_blocks.extend(content)
+                        elif isinstance(content, str) and content:
+                            pending_blocks.append({"type": "text", "text": content})
+                        pending_meta = {"model": m, "usage": usage,
+                                        "timestamp": ts,
+                                        "stop_reason": msg.get("stop_reason", "")}
+                    else:
+                        # New message — flush previous, start new buffer
+                        if pending_mid:
+                            _flush_assistant()
+                        pending_mid = mid or f"_anon_{len(events)}"
+                        pending_blocks = []
+                        if isinstance(content, list):
+                            pending_blocks = list(content)
+                        elif isinstance(content, str) and content:
+                            pending_blocks = [{"type": "text", "text": content}]
+                        pending_meta = {"model": m, "usage": usage,
+                                        "timestamp": ts,
+                                        "stop_reason": msg.get("stop_reason", "")}
+                    continue
+
+                # ── system ──
+                if t == "system":
+                    # Flush any pending assistant
+                    if pending_mid:
+                        _flush_assistant()
+                        pending_mid = ""
+                        pending_blocks = []
+                        pending_meta = {}
+
+                    subtype = obj.get("subtype", "") or ""
+                    content = obj.get("content", "") or ""
+                    level = obj.get("level", "") or ""
+                    if subtype in ("api_error", "compact_boundary",
+                                   "microcompact_boundary"):
+                        events.append({
+                            "type": "system_event",
+                            "subtype": subtype,
+                            "content": content if isinstance(content, str) else str(content),
+                            "level": level,
+                            "timestamp": ts,
+                        })
+                    continue
+
+                # ── other types (attachment, progress, file-history-snapshot,
+                #    last-prompt, permission-mode, pr-link, summary) — skip
+                # But flush pending assistant first
+                if pending_mid:
+                    _flush_assistant()
+                    pending_mid = ""
+                    pending_blocks = []
+                    pending_meta = {}
+
+        # Flush final pending assistant at EOF
+        if pending_mid:
+            _flush_assistant()
+
     except Exception as exc:
         import traceback
         try:
@@ -1484,10 +1598,7 @@ def read_transcript(session_id: str) -> dict:
         except OSError:
             pass
 
-    # Detect headless from entrypoint — done ONCE after parsing, not
-    # inside the per-line loop where it was previously misplaced.
-    if entrypoint == "sdk-cli":
-        is_headless = True
+    is_headless = (entrypoint == "sdk-cli")
 
     return {
         "events": events,
@@ -1496,7 +1607,7 @@ def read_transcript(session_id: str) -> dict:
         "cwd": cwd,
         "first_prompt": first_prompt,
         "model": model,
-        "usage": cum_usage,
+        "usage": {},  # usage now computed by _compute_session_usage
     }
 
 
