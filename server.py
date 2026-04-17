@@ -603,7 +603,7 @@ def _scan_transcript_header(path: Path, sid: str = "") -> dict:
         "usage": full,
         "num_turns": full.get("num_turns", 0),
         "ctx_peak_tokens": full.get("ctx_peak_tokens", 0),
-        "is_headless": permission_mode == "bypassPermissions" or entrypoint == "sdk-cli",
+        "is_headless": entrypoint == "sdk-cli",
         "permission_mode": permission_mode,
     }
 
