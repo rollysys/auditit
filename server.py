@@ -1412,28 +1412,38 @@ def read_transcript(session_id: str) -> dict:
 
                 elif t == "assistant":
                     m = msg.get("model", "")
-                    if m == "<synthetic>":
-                        continue
+                    is_synthetic = (m == "<synthetic>")
                     # Deduplicate
                     mid = msg.get("id", "")
                     if mid and mid in seen_msg_ids:
                         continue
                     if mid:
                         seen_msg_ids.add(mid)
-                    if m:
+                    if m and not is_synthetic:
                         model = m
-                    usage = msg.get("usage", {})
-                    if isinstance(usage, dict):
-                        cum_usage["input_tokens"] += (usage.get("input_tokens", 0) or 0)
-                        cum_usage["output_tokens"] += (usage.get("output_tokens", 0) or 0)
-                        cum_usage["cache_read_input_tokens"] += (usage.get("cache_read_input_tokens", 0) or 0)
-                        cum_usage["cache_creation_input_tokens"] += (usage.get("cache_creation_input_tokens", 0) or 0)
-                        cc = usage.get("cache_creation") or {}
-                        if isinstance(cc, dict):
-                            cum_usage["cache_creation"]["ephemeral_5m_input_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
-                            cum_usage["cache_creation"]["ephemeral_1h_input_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+                    # Only accumulate usage from real (non-synthetic) messages.
+                    # Synthetic messages are Claude Code's client-side error
+                    # responses (e.g. "Not logged in") — they carry no API usage.
+                    if not is_synthetic:
+                        usage = msg.get("usage", {})
+                        if isinstance(usage, dict):
+                            cum_usage["input_tokens"] += (usage.get("input_tokens", 0) or 0)
+                            cum_usage["output_tokens"] += (usage.get("output_tokens", 0) or 0)
+                            cum_usage["cache_read_input_tokens"] += (usage.get("cache_read_input_tokens", 0) or 0)
+                            cum_usage["cache_creation_input_tokens"] += (usage.get("cache_creation_input_tokens", 0) or 0)
+                            cc = usage.get("cache_creation") or {}
+                            if isinstance(cc, dict):
+                                cum_usage["cache_creation"]["ephemeral_5m_input_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+                                cum_usage["cache_creation"]["ephemeral_1h_input_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
 
                     content = msg.get("content", [])
+                    if isinstance(content, str) and content:
+                        events.append({"type": "assistant_text",
+                                       "text": content,
+                                       "model": m,
+                                       "usage": {},
+                                       "timestamp": ts})
+                        continue
                     if not isinstance(content, list):
                         continue
                     for item in content:
