@@ -345,15 +345,119 @@ _session_index_cache: dict[str, dict] = {}
 _session_index_ts: float = 0
 _SESSION_INDEX_TTL = 30.0  # seconds
 
+COST_CACHE_DIR = AUDIT_DIR / "_cost_cache"
 
-def _scan_transcript_header(path: Path) -> dict:
-    """Read only the first ~50 lines of a transcript for session metadata.
 
-    Much cheaper than read_transcript() (which parses the entire file for
-    events). We extract: cwd, entrypoint, first_prompt, model, started_at,
-    last known timestamp, and cumulative usage from the LAST assistant msg
-    we encounter in the header window. For cost we do a second pass to get
-    the file's last line (8KB tail seek for .jsonl, or decompress for .gz).
+def _compute_session_usage(path: Path, sid: str) -> dict:
+    """Full-parse a transcript to sum ALL assistant usage blocks.
+
+    Claude transcript usage is per-turn, not cumulative. Reading only the
+    tail gives the last turn's tokens, severely underestimating cost for
+    multi-turn sessions. This function walks the entire file once.
+
+    Results are cached to ~/.claude-audit/_cost_cache/<sid>.json keyed by
+    the transcript file's size. Cache hit = O(1) disk read. Cache miss =
+    full parse (can take 10-100ms for large transcripts). For completed
+    sessions (file size stable) the cache is permanent.
+    """
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return {}
+
+    cache_path = COST_CACHE_DIR / f"{sid}.json"
+    if cache_path.exists():
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            if isinstance(cached, dict) and cached.get("_file_size") == file_size:
+                return cached
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    cum: dict = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_5m_tokens": 0,
+        "cache_creation_1h_tokens": 0,
+    }
+    model = ""
+    num_turns = 0
+    seen_msg_ids: set[str] = set()
+    ctx_peak = 0
+
+    opener = gzip.open if path.name.endswith(".gz") else open
+    try:
+        with opener(path, "rt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if obj.get("type") == "user":
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        num_turns += 1
+                elif obj.get("type") == "assistant":
+                    msg = obj.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    m = msg.get("model", "")
+                    if m and m != "<synthetic>":
+                        model = m
+                    mid = msg.get("id", "")
+                    if mid and mid in seen_msg_ids:
+                        continue
+                    if mid:
+                        seen_msg_ids.add(mid)
+                    u = msg.get("usage")
+                    if not isinstance(u, dict):
+                        continue
+                    cum["input_tokens"] += (u.get("input_tokens", 0) or 0)
+                    cum["output_tokens"] += (u.get("output_tokens", 0) or 0)
+                    cum["cache_read_input_tokens"] += (u.get("cache_read_input_tokens", 0) or 0)
+                    cum["cache_creation_input_tokens"] += (u.get("cache_creation_input_tokens", 0) or 0)
+                    cc = u.get("cache_creation") or {}
+                    if isinstance(cc, dict):
+                        cum["cache_creation_5m_tokens"] += (cc.get("ephemeral_5m_input_tokens", 0) or 0)
+                        cum["cache_creation_1h_tokens"] += (cc.get("ephemeral_1h_input_tokens", 0) or 0)
+                    ctx_now = (
+                        (u.get("input_tokens", 0) or 0)
+                        + (u.get("cache_read_input_tokens", 0) or 0)
+                        + (u.get("cache_creation_input_tokens", 0) or 0)
+                    )
+                    if ctx_now > ctx_peak:
+                        ctx_peak = ctx_now
+    except OSError:
+        return {}
+
+    result = dict(cum)
+    result["model"] = model
+    result["num_turns"] = num_turns
+    result["ctx_peak_tokens"] = ctx_peak
+    result["_file_size"] = file_size
+
+    try:
+        COST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(result, f)
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+
+    return result
+
+
+def _scan_transcript_header(path: Path, sid: str = "") -> dict:
+    """Read transcript header (first ~50 lines) for metadata + full usage.
+
+    Metadata (cwd, entrypoint, prompt, timestamps): from header lines only.
+    Usage and cost: from _compute_session_usage (full parse, disk-cached).
     """
     cwd = entrypoint = first_prompt = model = ""
     started_at = last_ts = ""
@@ -406,25 +510,18 @@ def _scan_transcript_header(path: Path) -> dict:
                     m = msg.get("model", "")
                     if m and m != "<synthetic>":
                         model = m
-                    u = msg.get("usage")
-                    if isinstance(u, dict):
-                        usage = u
     except OSError:
         pass
 
-    # Tail read for last_ts + final usage (most accurate for cost).
-    # For .jsonl files, seek to the last 8KB. For .gz, we already have
-    # whatever we caught in the first 50 lines — skip the full decompress
-    # (build_stats will call read_transcript for cost-accurate data if needed).
+    # Tail read for last_ts only (timestamps, not usage).
     if not path.name.endswith(".gz"):
         try:
             with open(path, "rb") as f:
                 f.seek(0, 2)
                 end = f.tell()
-                chunk = min(16384, end)
+                chunk = min(8192, end)
                 f.seek(max(0, end - chunk))
                 tail = f.read()
-            # Walk backward to find the last few complete lines
             for raw_line in reversed(tail.splitlines()):
                 raw_line = raw_line.strip()
                 if not raw_line:
@@ -436,25 +533,16 @@ def _scan_transcript_header(path: Path) -> dict:
                 ts = obj.get("timestamp", "")
                 if ts:
                     last_ts = ts
-                t = obj.get("type", "")
-                if t == "assistant":
-                    msg = obj.get("message", {}) if isinstance(obj.get("message"), dict) else {}
-                    m = msg.get("model", "")
-                    if m and m != "<synthetic>":
-                        model = m
-                    u = msg.get("usage")
-                    if isinstance(u, dict) and u.get("output_tokens"):
-                        usage = u
-                    break
-                if t == "user":
-                    num_user_turns += 1
                     break
         except OSError:
             pass
 
-    # Count total user turns by counting newlines in user-type entries is
-    # too expensive. We use the rough count from the header + tail window,
-    # or fall back to 0 which is honest (the UI shows "—" for turns=0).
+    # Full usage: sum ALL assistant turns (disk-cached, so only expensive
+    # on first access per session). This is the only way to get accurate
+    # cost — transcript usage is per-turn, not cumulative.
+    full = _compute_session_usage(path, sid) if sid else {}
+    if full.get("model"):
+        model = full["model"]
 
     return {
         "cwd": cwd,
@@ -463,7 +551,9 @@ def _scan_transcript_header(path: Path) -> dict:
         "model": model,
         "started_at": started_at,
         "last_active_at": last_ts,
-        "usage": usage,
+        "usage": full,
+        "num_turns": full.get("num_turns", 0),
+        "ctx_peak_tokens": full.get("ctx_peak_tokens", 0),
         "is_headless": entrypoint == "sdk-cli",
     }
 
@@ -488,18 +578,11 @@ def list_sessions() -> dict:
     if not PROJECTS_DIR.exists():
         return {"sessions": []}
 
-    # Project dirs to skip: "memory" is Claude's auto-memory store, and
-    # plugin-internal project dirs (e.g. claude-mem observer daemon sessions)
-    # are not real user sessions.
-    SKIP_PROJECT_PATTERNS = ("memory", "observer-session", "claude-mem")
-
     for proj_dir in PROJECTS_DIR.iterdir():
         if not proj_dir.is_dir():
             continue
         proj_name = proj_dir.name
-        if proj_name.startswith("."):
-            continue
-        if any(pat in proj_name for pat in SKIP_PROJECT_PATTERNS):
+        if proj_name.startswith(".") or proj_name == "memory":
             continue
         for f in proj_dir.iterdir():
             if f.is_dir():
@@ -521,7 +604,7 @@ def list_sessions() -> dict:
             if sid in sessions_by_id:
                 continue
 
-            header = _scan_transcript_header(f)
+            header = _scan_transcript_header(f, sid)
             model = header.get("model", "")
             usage = header.get("usage", {})
             cost = compute_cost(model, _build_usage(usage) if usage else {})
@@ -555,7 +638,7 @@ def list_sessions() -> dict:
                 "model": model,
                 "cwd": header.get("cwd", ""),
                 "count": 0,
-                "turns": 0,
+                "turns": header.get("num_turns", 0),
                 "cost": round(cost, 4) if cost else 0,
                 "duration_ms": duration_ms,
                 "status": status,
