@@ -2234,13 +2234,14 @@ class AuditHandler(SimpleHTTPRequestHandler):
             summary.update(compute_ctx(model, summary.get("ctx_peak_tokens", 0)))
         # death.json: written by watchdog when claude is killed (SIGKILL/OOM)
         death = None
-        death_path = session_dir / "death.json"
-        if death_path.exists():
-            try:
-                with open(death_path) as f:
-                    death = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                pass
+        if session_dir:
+            death_path = session_dir / "death.json"
+            if death_path.exists():
+                try:
+                    with open(death_path) as f:
+                        death = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    pass
         self._json({"metadata": meta, "summary": summary, "death": death})
 
     def _serve_memory_file(self):
