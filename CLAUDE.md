@@ -1,78 +1,77 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Project Overview
 
-auditit is a global audit system for Claude Code sessions. It passively captures every session's prompts, tool calls, sub-agents, tokens, costs, context pressure, and process runtime info via Claude Code's hook mechanism, writing to `~/.claude-audit/<session_id>/`. A local web UI (`server.py :8765`) provides real-time tail, history replay, memory/skills viewer, and cross-session dashboard stats.
+auditit is a local session audit viewer for Claude Code. It reads Claude Code's native transcript files (`~/.claude/projects/<encoded>/<sid>.jsonl`) and presents them in a Web UI with cost analysis, session timeline, memory/skills browsing, and cross-session dashboard stats. **No hooks are installed** — the system is purely read-only.
 
 ## Architecture
 
 Pure Python stdlib, zero external dependencies:
 
-- **hook.py** — Python script registered as a global Claude Code hook for 25 events. On each hook fire: snapshots claude process runtime info from `/proc`, appends JSONL with optional `"proc"` sidecar. On `SessionStart`: double-forks a watchdog daemon that uses `os.pidfd_open` + `poll()` to detect SIGKILL/OOM (writes `death.json` if claude dies without SessionEnd). On `SessionEnd`: parses `transcript_path` for usage/model/cost/ctx_peak, writes `summary.json`, performs sub-agent slicing from `SubagentStop` transcripts, then atomically gzip-compresses the JSONL with line-count verification.
-- **server.py** — Threaded HTTP server on `:8765`. REST API for sessions/memory/skills/stats + SSE live tail. Computes cost and context pressure at serve-time from `PRICING`/`CTX_WINDOW` tables (no backfill needed). Provider detection via `env.json` (captured at hook time) with model-name fallback. Flat layout (no date partition).
-- **install.py** — Installer that copies hook.py to `~/.claude/hooks/auditit/` and writes hook entries into `~/.claude/settings.json`. Uses `# auditit` marker for idempotent install/uninstall (path-independent). Atomic write via tempfile+rename, fcntl lock, timestamped backups.
-- **web/index.html** — Single-file Web UI (Sessions | Memory | Skills | Dashboard tabs). Dark theme, SSE-based live tail, JSON syntax highlighting for tool input/output, markdown rendering, death record display.
-- **migrate_flatten.py** — One-shot migration: `~/.claude-audit/YYYY-MM-DD/<sid>/` → `~/.claude-audit/<sid>/` (flat). Also `--dedupe-flat` and `--backfill-mode`.
+- **server.py** — Threaded HTTP server on `:8765`. Discovers sessions by scanning `~/.claude/projects/` for transcript JSONL files. Parses transcripts with streaming merge (assistant messages are streamed as N lines per message.id; parser buffers and merges content arrays, taking the last line's usage as cumulative). Computes cost at serve-time from `PRICING`/`CTX_WINDOW` tables. Window-scoped cost/tokens for dashboard time ranges via `_compute_window_usage()`. Cost cache at `~/.claude-audit/_cost_cache/`.
+- **web/index.html** — Single-file Web UI (Sessions | Dashboard | Memory | Skills tabs). Dark theme. Chart.js + marked.js inlined for offline use. Client-side session grouping by last_active_at, scripted/interactive toggle, paginated tables.
+- **install.py** — Hook installer (currently unused — hooks uninstalled). Copies hook to `~/.claude/hooks/auditit/` and writes to `~/.claude/settings.json`. Kept for potential future use.
+- **hook.py** — Hook script (currently not installed). Was used for event capture before the transcript-viewer architecture.
+- **migrate_flatten.py** — One-shot migration tools: flatten old `YYYY-MM-DD/<sid>/` layout to flat `<sid>/`, dedupe, and backfill scripted-session classification.
+- **tests/test_transcript.py** — 12 unit tests for the transcript parser (streaming merge, synthetic messages, system events, path safety, etc.).
+- **tests/smoke.py** — Hook-era smoke tests (retained for reference).
 
 ## Key Design Constraints
 
-- **hook.py must never block or crash**: It runs as a global hook; a broken hook blocks all Claude sessions. Fix by running `python3 install.py uninstall` from a regular terminal, fix the bug, then reinstall.
-- **`~/.claude-audit/` files are immutable audit evidence**: Never modify, only read. Deletion must go through the Web UI or `DELETE /api/sessions/...`.
-- **Pricing/context tables need manual updates**: New models require updating both `server.py` (`PRICING`, `CTX_WINDOW`) and `docs/claude-pricing.md` / `docs/claude-context-windows.md`.
-- **Watchdog uses `os.pidfd_open` (Python 3.9+, Linux 5.3+)**: Falls back to polling `os.kill(pid, 0)` on macOS/older kernels. The watchdog is spawned via double-fork in SessionStart and writes `death.json` when the claude process disappears.
-- **Proc snapshots read only `/proc/pid/status` + `stat`**: Avoid `smaps_rollup` (~6ms for large processes); RSS from `status` is sufficient.
+- **No hooks installed**: Zero runtime overhead. All data comes from Claude Code's own transcript files. Never modify `~/.claude/projects/` — read only.
+- **Transcript streaming merge**: A single assistant message produces N JSONL lines (one per content block: thinking, text, tool_use), all sharing the same `message.id`. The parser MUST merge by id, not skip duplicates. The LAST line's usage is cumulative; earlier lines have partial values.
+- **`<synthetic>` messages**: Model `<synthetic>` means Claude Code's client-side response (e.g. "Not logged in"). Must be rendered (not skipped) but excluded from usage accumulation.
+- **`isMeta` lines**: Skip for display — they are internal/command messages.
+- **Scripted detection**: Only `entrypoint=sdk-cli` is reliable. `permissionMode=bypassPermissions` has false positives (interactive users with `--dangerously-skip-permissions`).
+- **Window-scoped cost**: Dashboard time ranges (1d/7d/30d) must compute cost only for turns within the window, not lifetime. `_compute_window_usage()` re-parses the transcript for each session.
+- **Cost cache** (`~/.claude-audit/_cost_cache/<sid>.json`): Keyed by file size. Delete the cache dir to force re-computation.
+- **Pricing/context tables need manual updates**: New models require updating `PRICING` and `CTX_WINDOW` dicts in server.py.
 
 ## Common Commands
 
 ```bash
-# Install/uninstall hooks
-python3 install.py doctor          # pre-flight checks
-python3 install.py install         # register hooks + copy hook.py
-python3 install.py install --dry-run  # preview without writing
-python3 install.py uninstall       # remove hooks (marker-based, path-independent)
-python3 install.py status          # show which events have hooks
-
 # Run web server
 python3 server.py                  # starts on http://0.0.0.0:8765
 
-# Migrate old date-partitioned data
-python3 migrate_flatten.py                  # flatten + consolidate
+# Run tests
+python3 tests/test_transcript.py   # 12 transcript parser tests
+python3 tests/smoke.py             # hook-era smoke tests
+
+# Clear cost cache (forces re-computation on next load)
+rm -rf ~/.claude-audit/_cost_cache/
+
+# Legacy migration (from hook-era data)
+python3 migrate_flatten.py                  # flatten date-partitioned dirs
 python3 migrate_flatten.py --dedupe-flat    # remove duplicate events
 python3 migrate_flatten.py --backfill-mode  # classify scripted sessions
-
-# Read audit logs (for debugging)
-zcat ~/.claude-audit/<session-id>/audit.jsonl.gz  # compressed
-cat ~/.claude-audit/<session-id>/audit.jsonl       # active
 ```
 
 ## Data Model
 
-Session directories live under `~/.claude-audit/<session_id>/` (flat, no date partition):
+**Primary data source**: `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`
 
-| File | Written by | Contents |
-|------|-----------|----------|
-| `audit.jsonl` | hook.py | `{"ts":"...","event":"...","data":{...},"proc":{...}}` per line |
-| `audit.jsonl.gz` | hook.py (SessionEnd) | Atomic gzip of jsonl, verified line count |
-| `summary.json` | hook.py (SessionEnd) | model, num_turns, duration_ms, usage, ctx_peak_tokens |
-| `metadata.json` | server.py (first read) | Cached prompt, model, cwd, started_at, last_active_at |
-| `env.json` | hook.py (first event) | anthropic_base_url, use_bedrock, use_vertex, claude_pid, is_headless, parent_cmd |
-| `meta.json` | hook.py (sub-agent only) | is_subagent, parent_session_id, agent_type, description |
-| `death.json` | watchdog (on kill) | ts, claude_pid, event="process_death_detected", note |
-| `.watchdog` | hook.py (SessionStart) | Flag file containing claude PID; removed by SessionEnd |
+Transcript line types the parser handles:
 
-Sub-agent directories: `<parent_sid>__agent__<agent_id>/` (siblings, not nested). `__agent__` is the separator constant.
+| Type | Key Fields | Parser Action |
+|------|-----------|---------------|
+| `user` | message.content (str or [{tool_result}]) | user_text / tool_result events |
+| `assistant` | message.{id, model, content[], usage} | Streaming merge → assistant_text / thinking / tool_use |
+| `system` | subtype, content | api_error / compact_boundary → system_event |
+| `queue-operation` | operation, content | Extract first prompt from enqueue |
+| `attachment` | attachment, message=None | Skip (but don't crash on null message) |
+| `file-history-snapshot` | snapshot | Skip |
+| `permission-mode` | permissionMode | Extract permission mode |
 
-## API Endpoints (server.py)
+**Legacy data**: `~/.claude-audit/<session-id>/` (from hook era, read-only fallback)
 
-- `GET /api/sessions` — list all sessions with has_death flag
-- `GET /api/sessions/<sid>/events` — all events (handles .gz transparently)
-- `GET /api/sessions/<sid>/stream` — SSE live tail
-- `GET /api/sessions/<sid>/meta` — metadata + summary + death record (cost computed on-the-fly)
-- `GET /api/memory` — memory file index across all projects
-- `GET /api/memory/file?path=<abs>` — read a single memory file (strict allow-list)
-- `GET /api/stats` — cross-session dashboard aggregates
-- `GET /api/skills` — list user-level skills
-- `GET /api/skills/file?name=<n>&path=<rel>` — read a skill file
-- `DELETE /api/sessions/<sid>` — delete session (cascade sub-agents, active check)
+## API Endpoints
+
+- `GET /api/sessions` — list all sessions (transcript scan, cached 30s)
+- `GET /api/sessions/<sid>/transcript` — parsed transcript events (streaming-merged)
+- `GET /api/sessions/<sid>/events` — legacy audit events (fallback)
+- `GET /api/sessions/<sid>/meta` — metadata + summary (transcript fallback when no audit dir)
+- `GET /api/stats?range=7d&exclude_scripted=1` — dashboard aggregates (window-scoped)
+- `GET /api/memory` / `GET /api/skills` — memory + skills viewer
+- `DELETE /api/sessions/<sid>` — delete session (cascade sub-agents)
