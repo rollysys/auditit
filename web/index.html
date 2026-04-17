@@ -319,6 +319,10 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 .expand-btn.subagent-btn { background: var(--cyan); color: var(--bg1); border: none; font-weight: 600; }
 .event-row.checkpoint { color: var(--gray); background: var(--bg2); border-left: 2px solid var(--yellow); }
 .event-row.checkpoint .tool-name { color: var(--yellow); }
+.event-row.system-event { color: var(--gray); background: var(--bg2); border-left: 2px solid var(--blue); opacity: 0.8; }
+.event-row.system-event .tool-name { color: var(--blue); font-size: 10px; }
+.event-row.system-event.error { border-left-color: var(--red); }
+.event-row.system-event.error .tool-name { color: var(--red); }
 .event-row.assistant-msg { color: var(--fg); }
 .event-row.assistant-msg .tool-name { color: var(--blue); }
 .event-row.task-event { color: var(--orange); }
@@ -983,7 +987,54 @@ function renderTranscriptEvents(events, container) {
       renderTranscriptToolUse(ts, e, container);
     } else if (t === 'tool_result') {
       renderTranscriptToolResult(ts, e, container);
+    } else if (t === 'system_event') {
+      renderTranscriptSystemEvent(ts, e, container);
     }
+  }
+}
+
+function renderTranscriptSystemEvent(ts, e, container) {
+  const subtype = e.subtype || 'system';
+  const content = e.content || '';
+  const level = e.level || '';
+
+  let icon = 'ℹ️';
+  let cls = 'system-event';
+  let label = subtype;
+  if (subtype === 'api_error') {
+    icon = '⚠️';
+    cls = 'system-event error';
+    label = 'API ERROR';
+  } else if (subtype === 'compact_boundary') {
+    icon = '📦';
+    label = 'COMPACT';
+  } else if (subtype === 'microcompact_boundary') {
+    icon = '📦';
+    label = 'MICRO-COMPACT';
+  }
+
+  const preview = typeof content === 'string'
+    ? (content.length > 200 ? content.substring(0, 200) + '…' : content)
+    : '';
+  const row = makeRow(ts, icon, label, esc(preview), cls);
+
+  if (content && typeof content === 'string' && content.length > 200) {
+    const panel = document.createElement('div');
+    panel.className = 'detail-content input-panel';
+    panel.innerHTML = `<pre class="json-block">${esc(content)}</pre>`;
+
+    const btn = document.createElement('button');
+    btn.className = 'expand-btn';
+    btn.textContent = 'full';
+    btn.onclick = () => {
+      const open = panel.classList.toggle('open');
+      btn.textContent = open ? 'hide' : 'full';
+    };
+    row.querySelector('.actions').appendChild(btn);
+    container.appendChild(row);
+    container.appendChild(panel);
+  } else {
+    container.appendChild(row);
   }
 }
 
