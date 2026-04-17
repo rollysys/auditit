@@ -1165,8 +1165,8 @@ def build_stats(exclude_scripted: bool = False,
     by_model_list    = sorted(by_model.values(),    key=lambda x: -x["cost"])
     by_provider_list = sorted(by_provider.values(), key=lambda x: -x["cost"])
 
-    top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])[:20]
-    top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])[:20]
+    top_by_cost = sorted(all_sessions, key=lambda x: -x["cost"])
+    top_by_ctx  = sorted(all_sessions, key=lambda x: -x["ctx_peak_pct"])
 
     # Most expensive hours: catches "many cheap sessions add up" which
     # top_by_cost (individual max) misses.

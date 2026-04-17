@@ -183,6 +183,15 @@ body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--f
 .dash-ctx-fill.warn { background: var(--yellow); }
 .dash-ctx-fill.hot  { background: var(--red); }
 .dash-cell-prompt { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--gray); }
+.dash-pagination {
+  display: flex; align-items: center; gap: 4px; margin-top: 6px; justify-content: center;
+}
+.dash-pagination button {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--gray);
+  padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px;
+}
+.dash-pagination button:hover { background: var(--border); color: var(--fg); }
+.dash-pagination button.active { background: var(--bg); color: var(--cyan); border-color: var(--cyan); font-weight: 600; }
 
 /* Layout: left sidebar + right detail */
 .layout { display: flex; height: calc(100vh - 30px); }
@@ -1859,8 +1868,8 @@ function renderDashboard(s) {
   html += '<div class="dash-table-box"><h4>Model breakdown</h4>';
   html += '<table class="dash-table"><thead><tr>';
   html += '<th>Provider</th><th>Model</th><th class="num">Sessions</th><th class="num">Cost</th>';
-  html += '<th class="num">Calls/hr</th><th class="num">Input</th><th class="num">Output</th>';
-  html += '<th class="num">Cache read</th><th class="num">Cache write</th><th class="num">Turns</th>';
+  html += '<th class="num">Turns</th><th class="num">Input</th><th class="num">Output</th>';
+  html += '<th class="num">Cache read</th><th class="num">Cache write</th>';
   html += '</tr></thead><tbody>';
   for (const m of s.by_model) {
     html += '<tr>';
@@ -1868,12 +1877,11 @@ function renderDashboard(s) {
     html += `<td><span class="dash-model-chip">${esc(m.model)}</span></td>`;
     html += `<td class="num">${m.sessions}</td>`;
     html += `<td class="num">${_fmtCost(m.cost)}</td>`;
-    html += `<td class="num">${(m.calls_per_hr || 0).toFixed(1)}</td>`;
+    html += `<td class="num">${m.turns}</td>`;
     html += `<td class="num">${_fmtNum(m.input_tokens)}</td>`;
     html += `<td class="num">${_fmtNum(m.output_tokens)}</td>`;
     html += `<td class="num">${_fmtNum(m.cache_read_tokens)}</td>`;
     html += `<td class="num">${_fmtNum(m.cache_creation_tokens)}</td>`;
-    html += `<td class="num">${m.turns}</td>`;
     html += '</tr>';
   }
   html += '</tbody></table></div>';
@@ -1894,30 +1902,81 @@ function renderDashboard(s) {
   }
   html += '</tbody></table></div>';
 
-  // Individual-session rankings
+  // Session tables with client-side pagination. Store the full sorted
+  // arrays globally so the page buttons can re-render without refetching.
+  window._dashCostData = s.top_by_cost || [];
+  window._dashCtxData  = s.top_by_ctx  || [];
+
   html += '<div class="dash-top-grid">';
-  html += '<div class="dash-table-box"><h4>Top 20 individual sessions by cost</h4>';
-  html += '<table class="dash-table"><thead><tr><th>Date</th><th>Provider</th><th>Model</th><th class="num">Cost</th><th class="num">Calls/hr</th><th>Prompt</th></tr></thead><tbody>';
-  for (const r of s.top_by_cost) {
-    html += `<tr data-date="${escAttr(r.date)}" data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
+  html += '<div class="dash-table-box"><h4>Sessions by cost <span id="costPageInfo" style="font-weight:normal;color:var(--gray)"></span></h4>';
+  html += '<div id="costTableBody"></div>';
+  html += '<div class="dash-pagination" id="costPagination"></div>';
+  html += '</div>';
+
+  html += '<div class="dash-table-box"><h4>Sessions by context pressure <span id="ctxPageInfo" style="font-weight:normal;color:var(--gray)"></span></h4>';
+  html += '<div id="ctxTableBody"></div>';
+  html += '<div class="dash-pagination" id="ctxPagination"></div>';
+  html += '</div>';
+  html += '</div>';
+
+  panel.innerHTML = html;
+
+  // Render charts after DOM is in place
+  _drawProviderCostChart(s.by_provider);
+  _drawModelCostChart(s.by_model);
+  const range = document.getElementById('dashRangeSelect')?.value || 'all';
+  const autoGran = range === '1d' ? 'hour' : 'day';
+  _drawCostTrend(s, autoGran);
+
+  // Render paginated tables
+  _renderCostPage(1);
+  _renderCtxPage(1);
+}
+
+const _PAGE_SIZE = 20;
+
+function _renderCostPage(page) {
+  const data = window._dashCostData || [];
+  const totalPages = Math.max(1, Math.ceil(data.length / _PAGE_SIZE));
+  page = Math.max(1, Math.min(page, totalPages));
+  const start = (page - 1) * _PAGE_SIZE;
+  const slice = data.slice(start, start + _PAGE_SIZE);
+
+  let html = '<table class="dash-table"><thead><tr><th>Date</th><th>Provider</th><th>Model</th><th class="num">Cost</th><th class="num">Turns</th><th>Prompt</th></tr></thead><tbody>';
+  for (const r of slice) {
+    html += `<tr data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
     html += `<td>${esc(r.date)}</td>`;
     html += `<td><span class="dash-provider-chip ${esc(r.provider || 'unknown')}">${esc(r.provider || 'unknown')}</span></td>`;
     html += `<td><span class="dash-model-chip">${esc(r.model)}</span></td>`;
     html += `<td class="num">${_fmtCost(r.cost)}</td>`;
-    html += `<td class="num">${(r.calls_per_hr || 0).toFixed(1)}</td>`;
+    html += `<td class="num">${r.turns || 0}</td>`;
     html += `<td class="dash-cell-prompt" title="${escAttr(r.prompt)}">${esc(r.prompt)}</td>`;
     html += '</tr>';
   }
-  html += '</tbody></table></div>';
+  html += '</tbody></table>';
+  document.getElementById('costTableBody').innerHTML = html;
+  document.getElementById('costPageInfo').textContent = `(${data.length} sessions)`;
+  _renderPagination('costPagination', page, totalPages, _renderCostPage);
+  // Re-bind click-through
+  document.getElementById('costTableBody').querySelectorAll('tr[data-sid]').forEach(tr => {
+    tr.addEventListener('click', () => { switchView('sessions'); setTimeout(() => openSession(tr.dataset.sid), 50); });
+  });
+}
 
-  html += '<div class="dash-table-box"><h4>Top 20 sessions by context pressure</h4>';
-  html += '<table class="dash-table"><thead><tr><th>Date</th><th>Model</th><th>Pressure</th><th class="num">Peak</th><th>Prompt</th></tr></thead><tbody>';
-  for (const r of s.top_by_ctx) {
+function _renderCtxPage(page) {
+  const data = window._dashCtxData || [];
+  const totalPages = Math.max(1, Math.ceil(data.length / _PAGE_SIZE));
+  page = Math.max(1, Math.min(page, totalPages));
+  const start = (page - 1) * _PAGE_SIZE;
+  const slice = data.slice(start, start + _PAGE_SIZE);
+
+  let html = '<table class="dash-table"><thead><tr><th>Date</th><th>Model</th><th>Pressure</th><th class="num">Peak</th><th>Prompt</th></tr></thead><tbody>';
+  for (const r of slice) {
     const pct = r.ctx_peak_pct || 0;
     const klass = _ctxClass(pct);
     const pctStr = (pct * 100).toFixed(0) + '%';
     const w = Math.min(100, pct * 100);
-    html += `<tr data-date="${escAttr(r.date)}" data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
+    html += `<tr data-sid="${escAttr(r.id)}" style="cursor:pointer">`;
     html += `<td>${esc(r.date)}</td>`;
     html += `<td><span class="dash-model-chip">${esc(r.model)}</span></td>`;
     html += `<td><span class="dash-ctx-bar"><span class="dash-ctx-fill ${klass}" style="width:${w}%"></span></span>${pctStr}</td>`;
@@ -1925,30 +1984,37 @@ function renderDashboard(s) {
     html += `<td class="dash-cell-prompt" title="${escAttr(r.prompt)}">${esc(r.prompt)}</td>`;
     html += '</tr>';
   }
-  html += '</tbody></table></div>';
-  html += '</div>';
-
-  panel.innerHTML = html;
-
-  // Click-through to Sessions tab
-  panel.querySelectorAll('tr[data-sid]').forEach(tr => {
-    tr.addEventListener('click', () => {
-      const sid = tr.dataset.sid;
-      switchView('sessions');
-      // loadSessions may already have data; wait a tick then open
-      setTimeout(() => {
-        if (typeof openSession === 'function') openSession(sid);
-      }, 50);
-    });
+  html += '</tbody></table>';
+  document.getElementById('ctxTableBody').innerHTML = html;
+  document.getElementById('ctxPageInfo').textContent = `(${data.length} sessions)`;
+  _renderPagination('ctxPagination', page, totalPages, _renderCtxPage);
+  document.getElementById('ctxTableBody').querySelectorAll('tr[data-sid]').forEach(tr => {
+    tr.addEventListener('click', () => { switchView('sessions'); setTimeout(() => openSession(tr.dataset.sid), 50); });
   });
+}
 
-  // Render charts after DOM is in place
-  _drawProviderCostChart(s.by_provider);
-  _drawModelCostChart(s.by_model);
-  // Auto-pick chart granularity based on the global range selector
-  const range = document.getElementById('dashRangeSelect')?.value || 'all';
-  const autoGran = range === '1d' ? 'hour' : (range === '7d' ? 'day' : 'day');
-  _drawCostTrend(s, autoGran);
+function _renderPagination(containerId, current, total, renderFn) {
+  const el = document.getElementById(containerId);
+  if (!el || total <= 1) { if (el) el.innerHTML = ''; return; }
+  let html = '';
+  if (current > 1) html += `<button data-page="${current-1}">← Prev</button>`;
+  // Show first, current-1, current, current+1, last
+  const pages = new Set([1]);
+  if (current > 1) pages.add(current - 1);
+  pages.add(current);
+  if (current < total) pages.add(current + 1);
+  pages.add(total);
+  let prev = 0;
+  for (const p of [...pages].sort((a,b) => a-b)) {
+    if (prev && p - prev > 1) html += '<span style="color:var(--gray);margin:0 4px">…</span>';
+    html += `<button data-page="${p}" ${p === current ? 'class="active"' : ''}>${p}</button>`;
+    prev = p;
+  }
+  if (current < total) html += `<button data-page="${current+1}">Next →</button>`;
+  el.innerHTML = html;
+  el.querySelectorAll('button[data-page]').forEach(btn => {
+    btn.addEventListener('click', () => renderFn(parseInt(btn.dataset.page)));
+  });
 }
 
 const PROVIDER_COLORS = {
